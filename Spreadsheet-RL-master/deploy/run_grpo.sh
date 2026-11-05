@@ -7,7 +7,7 @@ CONDA_ROOT=${CONDA_ROOT:-/remote-home/yichengfu/anaconda3}
 
 source "$REPO/deploy/env.sh"
 export PATH="$CONDA_ROOT/envs/spread/bin:$PATH"
-export MODEL_PATH=${MODEL_PATH:-/remote-home/yichengfu/models/Qwen3-4B-Thinking-2507}
+export MODEL_PATH=${MODEL_PATH:-/remote-home/yichengfu/models/Qwen3.5-9B}
 export WANDB_MODE=${WANDB_MODE:-offline}
 
 NGPUS=${NGPUS:-4}
