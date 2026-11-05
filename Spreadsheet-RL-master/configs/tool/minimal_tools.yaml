@@ -1,0 +1,52 @@
+tools:
+  - class_name: "verl.tools.recalculate.RecalculateAndReadTool"
+    config:
+      parallel_safe: false
+      recalc_url: "${oc.env:SPREADSHEET_RL_RECALC_URL,http://127.0.0.1:5000/recalculate}"
+      timeout_s: 180
+      max_file_size_mb: 100
+      max_response_chars: 4096
+      type: native
+
+    tool_schema:
+      type: "function"
+      function:
+        name: "recalculate_and_read"
+        description: "Recalculate the workbook in Excel, save it when safe, and read requested ranges. Small ranges preserve matrix shape; large ranges return addressed samples. Reports updated, values_source, and any writeback_error."
+        parameters:
+          type: "object"
+          properties:
+            path:
+              type: "string"
+              description: "Relative workbook path; omit for data.xlsx."
+            cell_ranges:
+              type: "array"
+              description: "A1 ranges to read after recalculation."
+              items:
+                type: "string"
+          required: ["cell_ranges"]
+
+  - class_name: "verl.tools.sandbox_fusion_tools.SandboxFusionTool"
+    config:
+      parallel_safe: false
+      # Prefer an environment-provided endpoint (e.g. set by SLURM), fallback to the public template URL.
+      sandbox_fusion_url: "${oc.env:SANDBOX_FUSION_URL,http://127.0.0.1:8080/run_code}"
+      num_workers: 4
+      enable_global_rate_limit: false
+      default_timeout: 120
+      default_language: "python"
+      memory_limit_mb: 1024
+      type: native
+
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_interpreter"
+        description: "Execute Python code (fresh process each call)."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "Python code to execute."
+          required: ["code"]
