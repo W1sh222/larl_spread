@@ -1,0 +1,27 @@
+# 数据集与运行产物：体积大（约 6.6GB），且包含真实业务表格，不随仓库分发
+# 获取方式见 docs/environment.md
+Spreadsheet-RL-master/data/
+SpreadsheetBench/data/
+*/data/
+**/_workspaces/
+*.zip
+
+# 训练 / 推理 / 评测产物
+logs/
+outputs/
+rollout_data/
+validation_data/
+checkpoints/
+verl_data/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ipynb_checkpoints/
+
+# 工具缓存
+wandb/
+.pytest_cache/
