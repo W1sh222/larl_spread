@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import gc
 import logging
 import os
 import time
@@ -151,6 +152,16 @@ class ServerAdapter(BaseRollout):
             tags: weights or kv_cache.
         """
         if self.config.free_cache_engine:
+            # 训练与推理共卡时，训练阶段 allocator 缓存会长期占着显存，
+            # 先归还给驱动，否则 vLLM wake_up 重新映射权重会 OOM。
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_b, total_b = torch.cuda.mem_get_info()
+            logger.info(
+                "vllm wake_up: free %.2f GiB / total %.2f GiB",
+                free_b / 1024**3,
+                total_b / 1024**3,
+            )
             await self._execute_method("wake_up", kwargs={"tags": tags})
 
     async def release(self):

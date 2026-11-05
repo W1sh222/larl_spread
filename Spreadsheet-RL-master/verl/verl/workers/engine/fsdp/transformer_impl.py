@@ -746,9 +746,15 @@ class FSDPEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        # FSDP2 的 CPUOffloadPolicy 要求首次 forward 前参数仍在 CPU 上，
+        # 这里不能再用 verl 的手动 load/offload 来回搬，否则会触发
+        # "FSDP parameters should be materialized on CPU when enabling CPU offloading"。
+        use_offload_policy = self.engine_config.offload_policy and fsdp_version(self.module) == 2
+
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        if not use_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
@@ -771,12 +777,30 @@ class FSDPEngine(BaseEngine):
                     params = self.module.state_dict()
                     params = normalize_peft_param_name(params)
         else:
-            params = self.module.state_dict()
+            if self.engine_config.offload_policy and fsdp_version(self.module) == 2:
+                # FSDP2 + CPUOffloadPolicy 时参数常驻 CPU，但 DTensor 的 device_mesh 在 CUDA 上，
+                # self.module.state_dict() 内部的 param.detach() 会触发
+                # "Attempted to set the storage of a tensor on device cpu to ... cuda:0"。
+                # 这里直接收集参数/缓冲，DTensor 的搬移和 all-gather 交给下面的 per_tensor_param 处理。
+                # 只取持久化 buffer（与 state_dict 一致），非持久化 buffer 如
+                # rotary_pos_emb.original_inv_freq 在 vLLM 侧不存在，不能同步过去。
+                non_persistent = {
+                    f"{mod_name}.{buf_name}" if mod_name else buf_name
+                    for mod_name, module in self.module.named_modules()
+                    for buf_name in getattr(module, "_non_persistent_buffers_set", ())
+                }
+                params = dict(self.module.named_parameters(remove_duplicate=False))
+                params.update(
+                    (name, buf) for name, buf in self.module.named_buffers(remove_duplicate=False)
+                    if name not in non_persistent
+                )
+            else:
+                params = self.module.state_dict()
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-        if self._is_offload_param:
+        if self._is_offload_param and not use_offload_policy:
             offload_fsdp_model_to_cpu(self.module)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
@@ -1105,10 +1129,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
 
                 if calculate_entropy:
-                    if not self.engine_config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(logits)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                    # 大词表(如 248k)下一次性算 softmax 需要数十 GB，改为展平后按 token 分块
+                    flat_logits = logits.reshape(-1, logits.shape[-1])
+                    entropy = self.compute_entropy_from_logits(flat_logits).view(logits.shape[0], logits.shape[1])
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
