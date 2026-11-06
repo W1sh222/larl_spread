@@ -96,6 +96,36 @@ class ToolParser(ABC):
         return decorator
 
 
+_XML_FUNCTION_RE = regex.compile(r"<function=([^>\s]+)>(.*?)(?:</function>|$)", regex.DOTALL)
+_XML_PARAMETER_RE = regex.compile(r"<parameter=([^>\s]+)>(.*?)</parameter>", regex.DOTALL)
+
+
+def _parse_xml_tool_call(block: str) -> Optional[FunctionCall]:
+    """解析 Qwen3.5 原生 XML 工具调用格式。
+
+    形如:
+        <tool_call>
+        <function=inspect_range>
+        <parameter=range>
+        A1:B30
+        </parameter>
+        </function>
+        </tool_call>
+    """
+    func_match = _XML_FUNCTION_RE.search(block)
+    if not func_match:
+        return None
+    name, body = func_match.group(1), func_match.group(2)
+    arguments = {}
+    for param_match in _XML_PARAMETER_RE.finditer(body):
+        key, raw_value = param_match.group(1), param_match.group(2).strip()
+        try:
+            arguments[key] = json.loads(raw_value)
+        except Exception:
+            arguments[key] = raw_value
+    return FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False))
+
+
 @ToolParser.register("hermes")
 class HermesToolParser(ToolParser):
     """Adapted from https://github.com/vllm-project/vllm/blob/v0.9.1/vllm/entrypoints/openai/tool_parsers/hermes_tool_parser.py"""
@@ -146,7 +176,13 @@ class HermesToolParser(ToolParser):
                 function_call = json.loads(match)
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
+                continue
             except Exception as e:
+                # 兼容 Qwen3.5 原生的 <function=...><parameter=...>  XML 工具调用格式
+                xml_call = _parse_xml_tool_call(match)
+                if xml_call is not None:
+                    function_calls.append(xml_call)
+                    continue
                 errors.append(str(e))
                 logger.error(f"Failed to decode tool call: {e}")
 
