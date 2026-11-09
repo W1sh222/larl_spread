@@ -30,7 +30,13 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
+from verl.utils.fsdp_utils import (
+    fsdp_version,
+    get_fsdp_full_state_dict,
+    get_fsdp_state_ctx,
+    load_fsdp_model_to_gpu,
+    offload_fsdp_model_to_cpu,
+)
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 
@@ -181,6 +187,24 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
+    def _get_model_state_dict_for_save(self):
+        """获取可序列化的 model state_dict。
+
+        FSDP2 开启 CPUOffloadPolicy 时参数常驻 CPU，直接 state_dict() 会因为参数
+        storage 在 CPU、DTensor device mesh 在 CUDA 而报 storage 设备不一致；此时
+        临时把参数搬回 GPU 取 state_dict，取完再放回 CPU。
+        """
+        try:
+            return self.model.state_dict()
+        except RuntimeError as e:
+            if "storage" not in str(e) or fsdp_version(self.model) != 2:
+                raise
+            load_fsdp_model_to_gpu(self.model)
+            try:
+                return self.model.state_dict()
+            finally:
+                offload_fsdp_model_to_cpu(self.model)
+
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
         Save an FSDP checkpoint for this rank.
@@ -230,7 +254,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
                 if self.should_save_model:
-                    model_state_dict = self.model.state_dict()
+                    model_state_dict = self._get_model_state_dict_for_save()
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
