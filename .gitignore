@@ -2,6 +2,7 @@
 # 获取方式见 docs/environment.md
 Spreadsheet-RL-master/data/
 SpreadsheetBench/data/
+SpreadsheetBench-2/data/
 */data/
 **/_workspaces/
 *.zip
@@ -13,6 +14,7 @@ rollout_data/
 validation_data/
 checkpoints/
 verl_data/
+results/
 *.log
 
 # Python
