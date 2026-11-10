@@ -7,7 +7,9 @@ defaults:
   - _self_
 
 data:
-  max_prompt_length: 4096
+  # 多轮工具调用的 system prompt + tool schema 本身就占数千 token，
+  # 4096 会把几乎所有样本判为超长过滤掉（导致 num_samples=0 崩溃）
+  max_prompt_length: 8192
   return_raw_chat: True
 
 actor_rollout_ref:
