@@ -30,13 +30,7 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import (
-    fsdp_version,
-    get_fsdp_full_state_dict,
-    get_fsdp_state_ctx,
-    load_fsdp_model_to_gpu,
-    offload_fsdp_model_to_cpu,
-)
+from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 
@@ -145,7 +139,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
-                self.model.load_state_dict(model_state_dict)
+                if fsdp_version(self.model) == 2:
+                    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+                    set_model_state_dict(
+                        self.model,
+                        model_state_dict,
+                        options=StateDictOptions(full_state_dict=False, strict=True),
+                    )
+                else:
+                    self.model.load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:
@@ -190,20 +193,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
     def _get_model_state_dict_for_save(self):
         """获取可序列化的 model state_dict。
 
-        FSDP2 开启 CPUOffloadPolicy 时参数常驻 CPU，直接 state_dict() 会因为参数
-        storage 在 CPU、DTensor device mesh 在 CUDA 而报 storage 设备不一致；此时
-        临时把参数搬回 GPU 取 state_dict，取完再放回 CPU。
+        FSDP2 开启 CPUOffloadPolicy（fsdp_config.offload_policy=True）时参数常驻 CPU，
+        而 DTensor 的 device mesh 在 CUDA，直接 state_dict() 会在 param.detach() 时报
+        storage 设备不一致。改用 torch.distributed.checkpoint 的接口，它原生支持 CPU
+        offload 的分片参数。
         """
-        try:
-            return self.model.state_dict()
-        except RuntimeError as e:
-            if "storage" not in str(e) or fsdp_version(self.model) != 2:
-                raise
-            load_fsdp_model_to_gpu(self.model)
-            try:
-                return self.model.state_dict()
-            finally:
-                offload_fsdp_model_to_cpu(self.model)
+        if fsdp_version(self.model) == 2:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            return get_model_state_dict(
+                self.model, options=StateDictOptions(full_state_dict=False, cpu_offload=True)
+            )
+        return self.model.state_dict()
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
