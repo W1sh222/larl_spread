@@ -711,8 +711,13 @@ class FSDPEngine(BaseEngine):
         """
         Save FSDP checkpoint, handling parameter offload as needed.
         """
+        # FSDP2 启用 CPUOffloadPolicy 时参数常态在 CPU，而 DTensor 的 device mesh 仍在 CUDA；
+        # 此时 model.to(cuda) 会因 pin_memory 留下坏 DTensor，state_dict() 里 detach() 直接报错。
+        use_offload_policy = fsdp_version(self.module) == 2 and (
+            self.engine_config.offload_policy or self.engine_config.forward_only
+        )
         origin_module_device = next(self.module.parameters()).device.type
-        if self._is_offload_param or origin_module_device == "cpu":
+        if not use_offload_policy and (self._is_offload_param or origin_module_device == "cpu"):
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(
@@ -731,7 +736,10 @@ class FSDPEngine(BaseEngine):
         """
         import torch
 
-        if self._is_offload_param:
+        use_offload_policy = fsdp_version(self.module) == 2 and (
+            self.engine_config.offload_policy or self.engine_config.forward_only
+        )
+        if self._is_offload_param and not use_offload_policy:
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.load_checkpoint(

@@ -25,6 +25,7 @@ from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDictConfig, StateDictType
+from torch.distributed.tensor import DTensor
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 from transformers.dynamic_module_utils import custom_object_save
 
@@ -139,7 +140,28 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
-                if fsdp_version(self.model) == 2:
+                if self._is_fsdp2_cpu_offload():
+                    # set_model_state_dict 内部同样会调 state_dict()，这里逐张量 copy_ 回分片参数。
+                    params = dict(self.model.named_parameters(remove_duplicate=False))
+                    buffers = dict(self.model.named_buffers(remove_duplicate=False))
+                    with torch.no_grad():
+                        for name, tensor in model_state_dict.items():
+                            target = params.get(name)
+                            if target is None:
+                                target = buffers.get(name)
+                            if target is None:
+                                continue
+                            if isinstance(target, DTensor):
+                                local = tensor if tensor.device == target.device else tensor.to(target.device)
+                                new_dt = DTensor.from_local(
+                                    local,
+                                    device_mesh=target.device_mesh,
+                                    placements=target.placements,
+                                )
+                                target.copy_(new_dt)
+                            else:
+                                target.copy_(tensor)
+                elif fsdp_version(self.model) == 2:
                     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
                     set_model_state_dict(
@@ -190,14 +212,43 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
-    def _get_model_state_dict_for_save(self):
-        """获取可序列化的 model state_dict。
+    def _is_fsdp2_cpu_offload(self) -> bool:
+        """FSDP2 参数是否处于 CPU offload 常态（参数为 sharded DTensor 且驻留 CPU）。"""
+        if fsdp_version(self.model) != 2:
+            return False
+        param = next(self.model.parameters(), None)
+        return param is not None and param.device.type == "cpu"
 
-        FSDP2 开启 CPUOffloadPolicy（fsdp_config.offload_policy=True）时参数常驻 CPU，
-        而 DTensor 的 device mesh 在 CUDA，直接 state_dict() 会在 param.detach() 时报
-        storage 设备不一致。改用 torch.distributed.checkpoint 的接口，它原生支持 CPU
-        offload 的分片参数。
+    def _collect_fsdp2_sharded_state_dict(self) -> dict:
+        """直接收集分片参数与持久化 buffer，绕开 model.state_dict() 内部的 param.detach()。
+
+        CPUOffloadPolicy 下参数在 CPU、device mesh 在 CUDA，model.state_dict() 会抛
+        storage 设备不一致；DCP 的 cpu_offload 只在 state_dict() 返回后才搬运，救不了这里。
+        另外 DTensor 不能直接被 torch.save 序列化，需先取 local shard 存成普通 tensor。
         """
+        non_persistent = {
+            f"{module_name}.{buffer_name}" if module_name else buffer_name
+            for module_name, module in self.model.named_modules()
+            for buffer_name in getattr(module, "_non_persistent_buffers_set", ())
+        }
+
+        def _to_local(t):
+            if isinstance(t, DTensor):
+                return t.to_local()
+            return t
+
+        state_dict = {name: _to_local(p) for name, p in self.model.named_parameters(remove_duplicate=False)}
+        state_dict.update(
+            (name, _to_local(buf))
+            for name, buf in self.model.named_buffers(remove_duplicate=False)
+            if name not in non_persistent
+        )
+        return state_dict
+
+    def _get_model_state_dict_for_save(self):
+        if self._is_fsdp2_cpu_offload():
+            return self._collect_fsdp2_sharded_state_dict()
+
         if fsdp_version(self.model) == 2:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 

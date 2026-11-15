@@ -27,3 +27,6 @@ __pycache__/
 # 工具缓存
 wandb/
 .pytest_cache/
+
+# 第三方参考实现（上游仓库，仅本地参考，不纳入本仓库）
+context-language-models/
