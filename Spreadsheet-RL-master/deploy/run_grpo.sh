@@ -24,6 +24,10 @@ ENABLE_THINKING=${ENABLE_THINKING:-False}
 # 9B 的 embed_tokens 张量约 2.03GB（248320×4096 bf16），超过默认 1024MB 传输桶会导致
 # update_weights 断言失败 "Weight ... too large to fit in the bucket"
 BUCKET_MB=${BUCKET_MB:-4096}
+# A100 上 Qwen3.5 的 CUDA graph（FULL_AND_PIECEWISE）会偶发卡死：TP worker 在
+# sample_tokens 阶段无响应，EngineCore 报 RPC 超时后引擎死亡，整卡进入错误态。
+# 默认用 eager 模式（关闭 cuda graph），吞吐略降但稳定。
+ENFORCE_EAGER=${ENFORCE_EAGER:-True}
 
 cd "$REPO"
 bash configs/qwen3-4b.sh "$@" \
@@ -37,6 +41,7 @@ bash configs/qwen3-4b.sh "$@" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$MAX_MODEL_LEN" \
     actor_rollout_ref.model.override_config.attn_implementation="$ATTN_IMPL" \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes="$BUCKET_MB" \
+    actor_rollout_ref.rollout.enforce_eager="$ENFORCE_EAGER" \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.use_fused_kernels=False \
     trainer.n_gpus_per_node="$NGPUS" \
