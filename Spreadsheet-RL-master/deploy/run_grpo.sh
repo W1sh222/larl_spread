@@ -21,6 +21,9 @@ MAX_RESP_LEN=${MAX_RESP_LEN:-16384}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-24576}
 # Qwen3.5 默认会输出思考过程，会吃掉大段 response 预算，默认关闭（与已验证的 9B 配置一致）
 ENABLE_THINKING=${ENABLE_THINKING:-False}
+# 9B 的 embed_tokens 张量约 2.03GB（248320×4096 bf16），超过默认 1024MB 传输桶会导致
+# update_weights 断言失败 "Weight ... too large to fit in the bucket"
+BUCKET_MB=${BUCKET_MB:-4096}
 
 cd "$REPO"
 bash configs/qwen3-4b.sh "$@" \
@@ -33,6 +36,7 @@ bash configs/qwen3-4b.sh "$@" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$MAX_MODEL_LEN" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$MAX_MODEL_LEN" \
     actor_rollout_ref.model.override_config.attn_implementation="$ATTN_IMPL" \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes="$BUCKET_MB" \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.use_fused_kernels=False \
     trainer.n_gpus_per_node="$NGPUS" \

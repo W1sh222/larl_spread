@@ -103,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens=24576 \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="${TOOL_CONFIG_PATH}" \
