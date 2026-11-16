@@ -14,6 +14,7 @@
 
 import os
 import random
+import re
 import shutil
 
 import numpy as np
@@ -156,20 +157,30 @@ class BaseCheckpointManager:
             self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
+    # 里程碑 checkpoint：global_step 为其倍数时永久保留，不参与滚动删除
+    milestone_step_interval = 10
+
+    @classmethod
+    def is_milestone_checkpoint(cls, path: str) -> bool:
+        match = re.search(r"global_step_(\d+)", str(path))
+        return match is not None and int(match.group(1)) % cls.milestone_step_interval == 0
+
     def register_checkpoint(self, new_path: str, max_ckpt_to_keep: int):
         """
         Register a successfully saved checkpoint and enforce retention limit.
 
         Adds the new checkpoint path to tracking and removes excess old
-        checkpoints beyond max_ckpt_to_keep.
+        checkpoints beyond max_ckpt_to_keep. Checkpoints at milestone steps
+        (multiples of milestone_step_interval) are never removed.
         """
         self.previous_saved_paths.append(new_path)
         if not (max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0):
             return
-        if len(self.previous_saved_paths) > max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        removable = [p for p in self.previous_saved_paths if not self.is_milestone_checkpoint(p)]
+        if len(removable) > max_ckpt_to_keep:
+            stale = removable[: len(removable) - max_ckpt_to_keep]
+            self.remove_previous_save_local_path(stale)
+            self.previous_saved_paths = [p for p in self.previous_saved_paths if p not in stale]
 
     @staticmethod
     def get_rng_state():
