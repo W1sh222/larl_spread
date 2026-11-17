@@ -18,6 +18,7 @@ from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir,
 
 _DEFAULT_SPREADSHEET_RL_REWARD_TIMEOUT_S = 10800.0  # 3 hours minus buffer
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 _spreadsheet_rl_reward_semaphore: threading.BoundedSemaphore | None = None
 _spreadsheet_rl_reward_semaphore_initialized = False
@@ -212,8 +213,12 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
             file_bytes = f.read()
 
         if reward_semaphore is not None:
+            _t_sem_wait_start = time.monotonic()
             reward_semaphore.acquire()
             reward_semaphore_acquired = True
+            _t_sem_acquired = time.monotonic()
+        else:
+            _t_sem_acquired = None
 
         # Build multipart/form-data body with fields:
         #   thread_dir, file
@@ -293,6 +298,7 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
                 time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
                 continue
             job_id = job_id_raw
+            _t_job_accepted = time.monotonic()
             break
 
         result_path = payload.get("result_path")
@@ -339,6 +345,16 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
 
             status = poll_payload.get("status")
             if status in {"done", "error"}:
+                _t_done = time.monotonic()
+                logger.info(
+                    "reward_timing thread_dir=%s sem_wait=%.1fs submit=%.1fs eval=%.1fs total=%.1fs status=%s",
+                    thread_dir,
+                    (_t_sem_acquired - _t_sem_wait_start) if _t_sem_acquired is not None else 0.0,
+                    _t_job_accepted - _t_sem_acquired if _t_sem_acquired is not None else 0.0,
+                    _t_done - _t_job_accepted,
+                    _t_done - (_t_sem_wait_start if _t_sem_acquired is not None else _t_job_accepted),
+                    status,
+                )
                 try:
                     reward = float(poll_payload.get("reward", 0.0))
                 except Exception:

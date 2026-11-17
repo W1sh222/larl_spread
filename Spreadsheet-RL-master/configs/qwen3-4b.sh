@@ -45,6 +45,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size=128 \
+    data.seed=42 \
     data.val_batch_size=1400 \
     data.max_response_length=24576 \
     data.filter_overlong_prompts=True \
