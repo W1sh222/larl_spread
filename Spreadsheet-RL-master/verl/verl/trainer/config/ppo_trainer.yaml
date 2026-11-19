@@ -109,6 +109,21 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Credit Assignment Library settings.
+  # Only used when adv_estimator=credit_assignment. method selects the algorithm
+  # registered in the library (e.g. "gigpo"); params are method-specific.
+  credit_assignment:
+
+    # Registered credit assignment method name; null disables (must be set explicitly)
+    method: null
+
+    # Method-specific parameters, e.g. {gamma: 0.95, step_advantage_w: 0.2, grouping: exact}
+    params: {}
+
+    # Rollout-side step-state transition collection (ca_step_transitions etc.).
+    # null = auto-derive: enabled iff method == "rewardflow". Set true/false to override.
+    collect_step_states: null
+
 # config for the trainer
 trainer:
 
