@@ -140,8 +140,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
-                if self._is_fsdp2_cpu_offload():
-                    # set_model_state_dict 内部同样会调 state_dict()，这里逐张量 copy_ 回分片参数。
+                if fsdp_version(self.model) == 2:
+                    # set_model_state_dict / state_dict() 内部会调 param.detach()，在 FSDP2 CPU
+                    # offload 下会报 storage 设备不一致。这里逐张量把普通 tensor 拷回本地分片。
                     params = dict(self.model.named_parameters(remove_duplicate=False))
                     buffers = dict(self.model.named_buffers(remove_duplicate=False))
                     with torch.no_grad():
@@ -151,24 +152,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                                 target = buffers.get(name)
                             if target is None:
                                 continue
-                            if isinstance(target, DTensor):
-                                local = tensor if tensor.device == target.device else tensor.to(target.device)
-                                new_dt = DTensor.from_local(
-                                    local,
-                                    device_mesh=target.device_mesh,
-                                    placements=target.placements,
-                                )
-                                target.copy_(new_dt)
-                            else:
-                                target.copy_(tensor)
-                elif fsdp_version(self.model) == 2:
-                    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
-
-                    set_model_state_dict(
-                        self.model,
-                        model_state_dict,
-                        options=StateDictOptions(full_state_dict=False, strict=True),
-                    )
+                            local = target.to_local() if isinstance(target, DTensor) else target
+                            assert local.shape == tensor.shape, (
+                                f"checkpoint shape mismatch for {name}: {tuple(tensor.shape)} vs {tuple(local.shape)}"
+                            )
+                            local.copy_(tensor)
                 else:
                     self.model.load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
@@ -212,13 +200,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
-    def _is_fsdp2_cpu_offload(self) -> bool:
-        """FSDP2 参数是否处于 CPU offload 常态（参数为 sharded DTensor 且驻留 CPU）。"""
-        if fsdp_version(self.model) != 2:
-            return False
-        param = next(self.model.parameters(), None)
-        return param is not None and param.device.type == "cpu"
-
     def _collect_fsdp2_sharded_state_dict(self) -> dict:
         """直接收集分片参数与持久化 buffer，绕开 model.state_dict() 内部的 param.detach()。
 
@@ -234,8 +215,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         def _to_local(t):
             if isinstance(t, DTensor):
-                return t.to_local()
-            return t
+                t = t.to_local()
+            return t.detach().cpu()
 
         state_dict = {name: _to_local(p) for name, p in self.model.named_parameters(remove_duplicate=False)}
         state_dict.update(
@@ -246,15 +227,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         return state_dict
 
     def _get_model_state_dict_for_save(self):
-        if self._is_fsdp2_cpu_offload():
-            return self._collect_fsdp2_sharded_state_dict()
-
         if fsdp_version(self.model) == 2:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-            return get_model_state_dict(
-                self.model, options=StateDictOptions(full_state_dict=False, cpu_offload=True)
-            )
+            return self._collect_fsdp2_sharded_state_dict()
         return self.model.state_dict()
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
