@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import stat
+from collections import OrderedDict
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -36,15 +37,21 @@ from verl.experimental.agent_loop.tool_parser import TOOL_PARSER_ERROR_FUNCTION_
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
+from verl.trainer.credit_assignment.interface import INITIAL_STATE_MARKER
 from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir, normalize_workspace_id
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.workbook_fingerprint import fingerprint_workbook_cached
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _WORKSPACE_MANIFEST_VERSION = 1
+
+# 远程 sandbox 中修改 workbook、但本地 writeback 完成时序无代码级保证的 tool.
+# 用于 transition graph validity 排除与 terminal state trust 判定 (两者语义分离).
+_UNVERIFIED_WRITEBACK_TOOLS = frozenset({"code_interpreter"})
 
 
 def _resolve_safe_data_file(root: Path, relpath: Path) -> Optional[Path]:
@@ -152,6 +159,47 @@ def _atomic_copy_file(src: Path, dest: Path) -> None:
 
 def _normalize_primary_ext(extra_info: Any) -> str:
     return ".xlsx"
+
+
+def _resolve_collect_step_states(config: Any) -> bool:
+    """structured state transition 采集开关 (RewardFlow / GiGPO state anchor 用).
+
+    显式 algorithm.credit_assignment.collect_step_states 优先;
+    未配置时自动启用条件:
+      - method == "rewardflow": 需要 pre/post 状态, 杜绝 "选了 rewardflow 但没采集";
+      - method == "gigpo" 且 params.anchor == "state" (默认): Eq.7 的 anchor 是
+        pre-action full workbook fingerprint, 没有 transitions 时 gigpo 会直接 raise,
+        不允许静默退化成 observation anchor (两种 anchor 分组语义不同).
+    """
+    try:
+        ca = config.get("algorithm", None) if hasattr(config, "get") else None
+        ca = ca.get("credit_assignment", None) if ca is not None else None
+    except Exception:
+        return False
+    if not ca:
+        return False
+    try:
+        explicit = ca.get("collect_step_states", None)
+        if explicit is not None:
+            return bool(explicit)
+        method = ca.get("method", None)
+        if method == "rewardflow":
+            return True
+        if method == "gigpo":
+            params = ca.get("params", None) or {}
+            return str(params.get("anchor", "state")) == "state"
+        return False
+    except Exception:
+        return False
+
+
+def _workspace_primary_file(*, workspace_id: str, thread_dir: str, primary_ext: str) -> Path:
+    """镜像 _prepare_sheet_arena_workspace 的 dest 规则, 解析主 workbook 路径."""
+    requested_rel = f"{thread_dir}/output{primary_ext}"
+    requested_rel_lower = requested_rel.lower()
+    wants_flat_seed = requested_rel_lower.endswith("/output.xlsx") or requested_rel_lower == "output.xlsx"
+    dest_rel = Path("data.xlsx") if wants_flat_seed else Path(requested_rel)
+    return get_spreadsheet_rl_data_root() / "_workspaces" / workspace_id / dest_rel
 
 
 def _prepare_sheet_arena_workspace(*, workspace_id: str, thread_dir: str, primary_ext: str) -> None:
@@ -324,6 +372,33 @@ class AgentData:
 
         self.routed_experts = None
 
+        # Step-level metadata for credit assignment (算法中立): 每个 assistant decision = 1 step.
+        # _step_spans[k] = (start, end) 在 response 坐标系中的 assistant token span.
+        # _step_observations[k] = 该 step 决策前的环境观测 (pre-action state, 结构化 JSON);
+        # step 0 记录显式 INITIAL_STATE_MARKER (与 "观测缺失/为空" 区分, 由下游 method 判 invalid).
+        self._step_spans: list[tuple[int, int]] = []
+        self._step_observations: list[Optional[str]] = []
+        self._cur_obs_text: Optional[str] = None  # 下一次生成时用作 pre-action 观测
+
+        # Structured workbook-state transitions (算法中立; 仅 collect_step_states 启用时填充).
+        # _step_transitions[k] 与 _step_spans[k] 一一对应:
+        #   {"pre", "post", "executed", "status", "graph_valid", "reason"[, "tool_status"]}
+        # pre/post 为 "sha256:..." fingerprint 或 None (=unknown, 不得与其他 unknown 合并).
+        self._step_transitions: list[dict[str, Any]] = []
+        self._workbook_path: Optional[Path] = None
+        self._cur_state: Optional[str] = None
+        self._initial_state: Optional[str] = None
+        self._final_state: Optional[str] = None
+        self._terminal_reason: Optional[str] = None
+        self._last_executed_tool_names: list[str] = []  # 最后一次执行 tool 的 step 触及的 tool 名
+        self._state_cache: OrderedDict[tuple, dict] = OrderedDict()
+        self._state_stats: dict[str, Any] = {
+            "compute": 0,
+            "cache_hit": 0,
+            "unknown": 0,
+            "parse_ms": 0.0,
+        }
+
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
@@ -353,6 +428,9 @@ class ToolAgentLoop(AgentLoopBase):
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+
+        # RewardFlow 等 structured-state method 的采集开关 (默认关, GiGPO/GRPO 零开销).
+        self.collect_step_states = _resolve_collect_step_states(self.config)
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -416,6 +494,16 @@ class ToolAgentLoop(AgentLoopBase):
                         thread_dir,
                         e,
                     )
+                if self.collect_step_states:
+                    # 初始 state 必须在 rollout 中采集: workspace 会在 reward 评估后被删除.
+                    agent_data._workbook_path = _workspace_primary_file(
+                        workspace_id=request_id, thread_dir=thread_dir, primary_ext=primary_ext
+                    )
+                    state, reason = await self._fingerprint_state(agent_data)
+                    agent_data._cur_state = state
+                    agent_data._initial_state = state
+                    if state is None:
+                        logger.warning("initial workbook fingerprint failed (%s): %s", request_id, reason)
 
         # State machine loop
         state = AgentState.PENDING
@@ -461,8 +549,39 @@ class ToolAgentLoop(AgentLoopBase):
                 "turn_scores": agent_data.turn_scores,
                 "tool_rewards": agent_data.tool_rewards,
                 "sandbox_workspace_id": agent_data.request_id,
+                # credit assignment step metadata (每 trajectory 一个变长 list, 经 non_tensor_batch 传递).
+                # key 名算法中立: rollout 不得知晓具体 credit assignment 算法.
+                "ca_step_spans": [[int(s), int(e)] for (s, e) in agent_data._step_spans],
+                "ca_step_observations": list(agent_data._step_observations),
             }
         )
+        if self.collect_step_states:
+            # 兜底采一次 final state (最后一 batch 采集失败时仍可能补上磁盘现状).
+            final_state, _ = await self._fingerprint_state(agent_data)
+            agent_data._final_state = final_state if final_state is not None else agent_data._cur_state
+            if agent_data._terminal_reason is None:
+                agent_data._terminal_reason = "natural"
+            # Terminal state trust (与 transition graph validity 分离判定):
+            #   known   = terminal fingerprint 采集成功 (非 None);
+            #   trusted = known 且最后一次执行 tool 的 step 未触达 unverified-writeback tool.
+            # in-process / recalc 写入同步且已验证, 故其后的本地重读即 reward 评估对象;
+            # 若最后修改来自 code_interpreter (远程 writeback 时序不可证), 则不假定 fingerprint
+            # 存在即代表 writeback 完成 -> untrusted (不回退到更早 state, 也不声称已保证).
+            terminal_known = agent_data._final_state is not None
+            touched_unverified_terminal = any(
+                name in _UNVERIFIED_WRITEBACK_TOOLS for name in agent_data._last_executed_tool_names
+            )
+            terminal_trusted = terminal_known and not touched_unverified_terminal
+            output.extra_fields.update(
+                {
+                    "ca_step_transitions": [dict(t) for t in agent_data._step_transitions],
+                    "ca_initial_state": agent_data._initial_state,
+                    "ca_final_state": agent_data._final_state,
+                    "ca_terminal_trusted": terminal_trusted,
+                    "ca_terminal_reason": agent_data._terminal_reason,
+                    "ca_state_stats": dict(agent_data._state_stats),
+                }
+            )
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -481,6 +600,11 @@ class ToolAgentLoop(AgentLoopBase):
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
+        # 记录本 step (assistant decision) 的 pre-action 观测与 span 起点.
+        # 首次生成 (尚无任何 tool 观测) -> 显式 initial-state marker, 而非 None/空串.
+        step_start = len(agent_data.response_mask)
+        agent_data._step_observations.append(agent_data._cur_obs_text
+            if agent_data._cur_obs_text is not None else INITIAL_STATE_MARKER)
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -508,6 +632,20 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_ids = output.token_ids
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
+        # assistant token span [step_start, step_end); 截断后由下游 adapter clamp.
+        agent_data._step_spans.append((step_start, len(agent_data.response_mask)))
+        if self.collect_step_states:
+            # 与 span 一一对应的 transition placeholder; tool 执行完成后在 PROCESSING_TOOLS 中回填.
+            agent_data._step_transitions.append(
+                {
+                    "pre": agent_data._cur_state,
+                    "post": None,
+                    "executed": False,
+                    "status": "pending",
+                    "graph_valid": False,
+                    "reason": None,
+                }
+            )
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
 
@@ -516,10 +654,16 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            agent_data._terminal_reason = "response_length"
+            self._close_transition_unexecuted(agent_data, reason="response_length")
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            agent_data._terminal_reason = "max_assistant_turns"
+            self._close_transition_unexecuted(agent_data, reason="max_assistant_turns")
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            agent_data._terminal_reason = "max_user_turns"
+            self._close_transition_unexecuted(agent_data, reason="max_user_turns")
             return AgentState.TERMINATED
 
         # Extract tool calls (use per-sample tools if routed)
@@ -530,6 +674,9 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
         else:
+            agent_data._terminal_reason = "final_answer"
+            # 无 tool call 的 final answer: 不构成 state-changing edge, 但 token span 仍有效.
+            self._close_transition_final_answer(agent_data)
             return AgentState.TERMINATED
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
@@ -577,7 +724,20 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        # 逐条收集 (tool 名 + 响应文本), 保留执行顺序 (serial write 顺序影响后继状态, 不排序).
+        obs_parts: list[dict[str, str]] = []
+        obs_tool_names = (
+            [tc.name for tc in tool_calls]
+            + [tc.name for tc in serial_overflow_tool_calls]
+            + [tc.name for tc in parallel_overflow_tool_calls]
+        )
+        call_statuses: list[Optional[str]] = []
+        for call_idx, (tool_response, tool_reward, res) in enumerate(responses):
+            call_statuses.append(str(res.get("status")) if isinstance(res, dict) and res.get("status") else None)
+            obs_parts.append({
+                "tool": obs_tool_names[call_idx] if call_idx < len(obs_tool_names) else "",
+                "text": tool_response.text or "",
+            })
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -626,6 +786,13 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.tool_rewards.append(tool_reward)
 
         agent_data.messages.extend(add_messages)
+        # 序列化为结构化 JSON 观测 (含并行多 call): 下游 fingerprint 逐条规范化, 避免拼接破坏 JSON 解析.
+        agent_data._cur_obs_text = json.dumps(obs_parts, ensure_ascii=False)
+
+        # post-state fingerprint 必须在 observation 是否入 prompt 之前采集:
+        # tool 已执行, 下方 response_length 截断路径不能丢失最终 state.
+        if self.collect_step_states and agent_data._step_transitions:
+            await self._update_last_transition_post_state(agent_data, obs_tool_names, call_statuses)
 
         if self.tool_parser_name == "gpt-oss":
             logger.info("manually format tool responses for gpt-oss")
@@ -646,6 +813,7 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            agent_data._terminal_reason = "response_length_after_tools"
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
@@ -663,6 +831,89 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
+
+    # ---- structured workbook-state collection (算法中立 metadata) ----
+
+    def _fingerprint_sync(self, agent_data: AgentData) -> tuple[Optional[str], Optional[str]]:
+        path = agent_data._workbook_path
+        if path is None:
+            return None, "no_workspace_file"
+        try:
+            result = fingerprint_workbook_cached(str(path), agent_data._state_cache)
+        except Exception as exc:
+            return None, f"fingerprint_error:{type(exc).__name__}"
+        stats = agent_data._state_stats
+        if result.get("cache_hit"):
+            stats["cache_hit"] += 1
+        else:
+            stats["compute"] += 1
+            stats["parse_ms"] = round(float(stats["parse_ms"]) + float(result.get("parse_ms", 0.0)), 3)
+        if result.get("status") == "ok":
+            return result["fingerprint"], None
+        stats["unknown"] += 1
+        return None, str(result.get("reason", "unknown"))
+
+    async def _fingerprint_state(self, agent_data: AgentData) -> tuple[Optional[str], Optional[str]]:
+        # 避免长时间 block event loop.
+        return await asyncio.to_thread(self._fingerprint_sync, agent_data)
+
+    def _close_transition_unexecuted(self, agent_data: AgentData, *, reason: str) -> None:
+        """assistant decision 产生但未执行 tool (提前终止): 不构成 graph edge."""
+        if not (self.collect_step_states and agent_data._step_transitions):
+            return
+        tr = agent_data._step_transitions[-1]
+        if tr.get("status") != "pending":
+            return
+        tr["post"] = tr.get("pre")
+        tr["executed"] = False
+        tr["status"] = "terminated_before_tools"
+        tr["graph_valid"] = False
+        tr["reason"] = reason
+
+    def _close_transition_final_answer(self, agent_data: AgentData) -> None:
+        if not (self.collect_step_states and agent_data._step_transitions):
+            return
+        tr = agent_data._step_transitions[-1]
+        if tr.get("status") != "pending":
+            return
+        tr["post"] = tr.get("pre")
+        tr["executed"] = True
+        tr["status"] = "final_answer"
+        tr["graph_valid"] = False
+        tr["reason"] = None
+
+    async def _update_last_transition_post_state(
+        self,
+        agent_data: AgentData,
+        tool_names: list[str],
+        call_statuses: list[Optional[str]],
+    ) -> None:
+        tr = agent_data._step_transitions[-1]
+        post, reason = await self._fingerprint_state(agent_data)
+        tr["executed"] = True
+        tr["status"] = "executed"
+        tr["post"] = post
+        tr["tool_status"] = [
+            {"tool": str(name), "status": status}
+            for name, status in zip(tool_names, call_statuses)
+        ]
+        if post is None:
+            tr["graph_valid"] = False
+            tr["reason"] = reason or "state_unknown"
+            return
+        if tr.get("pre") is None:
+            tr["graph_valid"] = False
+            tr["reason"] = "pre_state_unknown"
+            agent_data._cur_state = post
+            return
+        # sandbox 远程 writeback 完成时序无代码级保证: 若本 step 含此类 tool,
+        # post-state 可能漏写 -> 保守排除出 graph (仅计 episode advantage).
+        agent_data._last_executed_tool_names = [str(name) for name in tool_names]
+        touched_unsafe = any(name in _UNVERIFIED_WRITEBACK_TOOLS for name in tool_names)
+        tr["graph_valid"] = not touched_unsafe
+        if touched_unsafe:
+            tr["reason"] = "external_writeback_unverified"
+        agent_data._cur_state = post
 
     async def _execute_tool_calls(
         self,

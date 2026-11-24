@@ -468,6 +468,56 @@ def compute_gdpo_outcome_advantage(
     return advantages, advantages
 
 
+@register_adv_est("credit_assignment")
+def compute_credit_assignment_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    batch: Optional[dict] = None,
+    metrics_out: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Credit Assignment Library 的通用 adapter (单一 estimator 入口).
+
+    从 config.algorithm.credit_assignment 读取 method 名与 params, 转交独立库计算
+    token-level advantage. 新增 credit assignment 算法只需在库中注册, 无需改本函数.
+
+    Args:
+        metrics_out: 可选的旁路 dict. 调用方 (ray_trainer.compute_advantage) 对所有
+            non-GAE/GRPO estimator 统一按 2-tuple 解包, 因此诊断量只能通过可变容器
+            传出, 不能塞进返回值. 不传时行为与之前完全一致.
+    """
+    assert config is not None, "credit_assignment 需要 algorithm config"
+    assert non_tensor_batch is not None, "credit_assignment 需要 non_tensor_batch (step metadata)"
+
+    ca_cfg = config.get("credit_assignment", None)
+    assert ca_cfg is not None, "adv_estimator=credit_assignment 需要配置 algorithm.credit_assignment"
+    method = ca_cfg.get("method", None)
+    assert method, "algorithm.credit_assignment.method 必须指定 (如 'gigpo')"
+    params = ca_cfg.get("params", {}) or {}
+
+    # 延迟 import, 避免与 trainer 的循环依赖.
+    from verl.trainer.credit_assignment import compute as _credit_assignment_compute
+
+    result = _credit_assignment_compute(
+        method=method,
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        non_tensor_batch=non_tensor_batch,
+        params=dict(params),
+    )
+
+    if metrics_out is not None:
+        # 加 method 前缀, 避免不同库方法的同名指标互相覆盖.
+        for key, value in (result.metrics or {}).items():
+            metrics_out[f"credit_assignment/{method}/{key}"] = float(value)
+
+    return result.advantages, result.returns
+
+
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,

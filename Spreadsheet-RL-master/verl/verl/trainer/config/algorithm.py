@@ -667,6 +667,9 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    # Credit Assignment Library 配置 (adv_estimator=credit_assignment 时生效).
+    # method: 已注册的算法名 (如 "gigpo"); params: 该算法的参数字典 (由各 method 自行校验).
+    credit_assignment: Optional[dict[str, Any]] = None
 
 
 @dataclass

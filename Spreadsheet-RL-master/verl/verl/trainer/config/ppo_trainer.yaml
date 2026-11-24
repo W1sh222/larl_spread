@@ -109,6 +109,33 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Credit Assignment Library settings.
+  # Only used when adv_estimator=credit_assignment. method selects the algorithm
+  # registered in the library (e.g. "gigpo"); params are method-specific.
+  credit_assignment:
+
+    # Registered credit assignment method name; null disables (must be set explicitly)
+    method: null
+
+    # Method-specific parameters, e.g. {gamma: 0.95, step_advantage_w: 0.2, grouping: exact}
+    # Keys must match the method's config dataclass (unknown keys raise at init). For "gigpo"
+    # see verl/trainer/credit_assignment/methods/gigpo/config.py::GiGPOConfig:
+    #   gamma (0.95), step_advantage_w (1.0), mode (mean_norm|mean_std_norm), grouping (exact),
+    #   epsilon (1e-6), anchor (state|observation), anchor_scope (full),
+    #   include_truncated_in_baseline (true).
+    # Output is a token-level advantage (step advantage broadcast onto each valid assistant
+    # token) consumed by the existing vanilla PPO loss; this node configures credit
+    # assignment only and has no policy-loss-side switches.
+    # NOTE: params 故意为空 (由各 method 的 config dataclass 校验), 所以命令行覆盖
+    # 必须用 Hydra 的 force-add 语法: ++algorithm.credit_assignment.params.step_advantage_w=1.0
+    params: {}
+
+    # Rollout-side step-state transition collection (ca_step_transitions etc.).
+    # null = auto-derive: enabled iff method == "rewardflow", or method == "gigpo" with
+    # params.anchor == "state" (default, because the state anchor needs pre-action fingerprints).
+    # Set true/false to override.
+    collect_step_states: null
+
 # config for the trainer
 trainer:
 

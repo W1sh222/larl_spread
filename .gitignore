@@ -30,3 +30,14 @@ wandb/
 
 # 第三方参考实现（上游仓库，仅本地参考，不纳入本仓库）
 context-language-models/
+
+# 本地实验工作区（快照备份 / 隔离测试依赖 / 探针临时目录），不随仓库分发
+.DS_Store
+.testlibs/
+.gigpo_step_loss_snapshot/
+.gigpo_snapshot_tool.sh
+gigpo_probe_*/
+
+# gigpo_smoke 只提交脚本与配置：模型权重、venv、数据与运行产物均不入库
+gigpo_smoke/models/
+gigpo_smoke/.venv-spread/

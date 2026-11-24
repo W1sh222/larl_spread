@@ -210,6 +210,14 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+        # credit_assignment: 通用库需要 step metadata (non_tensor_batch) 与 response_mask 等张量
+        ca_metrics: Optional[dict] = None
+        if adv_estimator == "credit_assignment":
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["batch"] = data.batch
+            # 库内诊断 (anchor / truncation / step advantage) 走可变 dict 旁路, 见 adv fn docstring
+            ca_metrics = {}
+            adv_kwargs["metrics_out"] = ca_metrics
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -228,6 +236,9 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if ca_metrics:
+            # fit() 里合并进 metrics; 不进入 batch 张量, 不影响下游训练数值
+            data.meta_info["ca_metrics"] = ca_metrics
     return data
 
 
@@ -1522,6 +1533,12 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Credit Assignment 库内诊断量 (anchor / truncation / step advantage)：
+                        # 由 compute_advantage 通过 meta_info 旁路带回，不进入 batch 张量。
+                        ca_metrics = batch.meta_info.pop("ca_metrics", None)
+                        if ca_metrics:
+                            metrics.update(ca_metrics)
 
                     # update critic
                     if self.use_critic:
