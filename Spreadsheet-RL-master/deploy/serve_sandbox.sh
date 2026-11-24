@@ -8,6 +8,9 @@ CONDA_ROOT=${CONDA_ROOT:-/remote-home/yichengfu/anaconda3}
 REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
 
 export SANDBOX_CONFIG=${SANDBOX_CONFIG:-hpc}
+# workspace 请求依赖该数据根；不设则回落到不存在的 /opt/sandboxfusion/data，
+# 导致所有带 workspace_id 的调用报 "workspace requested but could not be prepared"。
+export SANDBOX_DATA_ROOT=${SANDBOX_DATA_ROOT:-$REPO/data}
 export PYTHONPATH="$REPO/sandbox${PYTHONPATH:+:$PYTHONPATH}"
 cd "$REPO/sandbox"
 exec "$CONDA_ROOT/envs/sandbox/bin/uvicorn" sandbox.server.server:app --host "$HOST" --port "$PORT"

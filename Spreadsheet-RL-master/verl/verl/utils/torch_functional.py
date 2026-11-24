@@ -163,12 +163,48 @@ def logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> to
     return logpy
 
 
+class _ChunkedLogSoftmaxGather(torch.autograd.Function):
+    """分块 log_softmax(x_i) 的 autograd 实现。
+
+    forward 逐块在 fp32 下算 logsumexp，backward 用 softmax 重算梯度，
+    因此不会像 torch.logsumexp(chunk.float()) 那样把每块的 fp32 副本留在
+    计算图里（24k token × 248k 词表时约 20 GB）。
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, labels: torch.Tensor, chunk_size: int):
+        flat = logits.reshape(-1, logits.shape[-1])
+        lab = labels.reshape(-1)
+        ctx.save_for_backward(flat, lab)
+        ctx.chunk_size = chunk_size
+        out = torch.empty(flat.shape[0], dtype=torch.float32, device=flat.device)
+        for start in range(0, flat.shape[0], chunk_size):
+            chunk = flat[start : start + chunk_size].float()
+            lse = torch.logsumexp(chunk, dim=-1)
+            picked = torch.gather(chunk, dim=-1, index=lab[start : start + chunk_size, None]).squeeze(-1)
+            out[start : start + chunk_size] = picked - lse
+        return out.view(logits.shape[:-1])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        flat, lab = ctx.saved_tensors
+        g = grad_output.reshape(-1)
+        grad = torch.empty(flat.shape, dtype=flat.dtype, device=flat.device)
+        for start in range(0, flat.shape[0], ctx.chunk_size):
+            chunk = flat[start : start + ctx.chunk_size].float()
+            p = torch.softmax(chunk, dim=-1)
+            p[torch.arange(p.shape[0], device=p.device), lab[start : start + ctx.chunk_size]] -= 1
+            p.mul_(g[start : start + ctx.chunk_size, None])
+            grad[start : start + ctx.chunk_size] = p.to(flat.dtype)
+        return grad, None, None
+
+
 def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> torch.Tensor:
     """Memory-efficient log-probability computation using row-wise processing.
 
     Computes log-probabilities by processing one row at a time to reduce peak
-    memory consumption. Uses logsumexp for float32/float64, falls back to
-    log_softmax for bfloat16 due to numerical stability concerns.
+    memory consumption. Uses logsumexp for float32/float64, chunked
+    log_softmax for bfloat16 to avoid materializing another full-size tensor.
 
     The mathematical identity used is: log_softmax(x_i) = x_i - logsumexp(x)
 
@@ -190,13 +226,10 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> 
         logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
-        logprobs_labels = []
-        for row_logits, row_labels in zip(logits, labels, strict=True):  # loop to reduce peak mem consumption
-            row_logprobs = F.log_softmax(row_logits, dim=-1)
-            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            logprobs_labels.append(row_logprobs_labels)
-        logprobs_labels = torch.stack(logprobs_labels)
+        # bf16 下直接 log_softmax 会再分配一份 [seq_len, vocab_size] 的结果，
+        # 24k token × 248k 词表时约 12 GB；逐块计算并用自定义 backward 重算，
+        # 峰值只剩一个 chunk 的 fp32 副本。
+        logprobs_labels = _ChunkedLogSoftmaxGather.apply(logits, labels, 512)
     return logprobs_labels
 
 

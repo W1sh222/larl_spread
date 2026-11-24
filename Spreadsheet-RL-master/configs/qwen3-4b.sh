@@ -45,6 +45,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size=128 \
+    data.seed=42 \
     data.val_batch_size=1400 \
     data.max_response_length=24576 \
     data.filter_overlong_prompts=True \
@@ -115,7 +116,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=65536 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=65536 \
     algorithm.use_kl_in_reward=False \
-    +reward.max_concurrent=2 \
+    +reward.max_concurrent=4 \
     +reward.timeout=10800 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \

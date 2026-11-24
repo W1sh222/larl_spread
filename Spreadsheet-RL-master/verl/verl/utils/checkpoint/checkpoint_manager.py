@@ -152,13 +152,16 @@ class BaseCheckpointManager:
         """
         if not (max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 1):
             return
-        if len(self.previous_saved_paths) >= max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        # 里程碑 checkpoint 不参与滚动删除，需从候选里排除
+        rolling = [p for p in self.previous_saved_paths if not self.is_milestone_checkpoint(p)]
+        if len(rolling) >= max_ckpt_to_keep:
+            stale = rolling[: len(rolling) - max_ckpt_to_keep + 1]
+            self.remove_previous_save_local_path(stale)
+            self.previous_saved_paths = [p for p in self.previous_saved_paths if p not in stale]
 
     # 里程碑 checkpoint：global_step 为其倍数时永久保留，不参与滚动删除
-    milestone_step_interval = 10
+    # 每 5 步永久留一份（每份约 210 GB），其余按 max_actor_ckpt_to_keep 滚动
+    milestone_step_interval = 5
 
     @classmethod
     def is_milestone_checkpoint(cls, path: str) -> bool:
