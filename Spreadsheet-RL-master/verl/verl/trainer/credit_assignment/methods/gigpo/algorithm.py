@@ -9,8 +9,12 @@ import torch
 
 from verl.trainer.credit_assignment.interface import CreditAssignmentInput, CreditAssignmentMethod, CreditAssignmentOutput
 from verl.trainer.credit_assignment.methods.gigpo.config import GiGPOConfig
-from verl.trainer.credit_assignment.methods.gigpo.grouping import INVALID_FINGERPRINT, build_step_groups, fingerprint_anchor
+from verl.trainer.credit_assignment.methods.gigpo.grouping import (
+    INVALID_FINGERPRINT,
+    build_step_groups,
+)
 from verl.trainer.credit_assignment.registry import register_credit_assignment
+from verl.trainer.credit_assignment.state_meta import ANCHOR_MODE_STATE, StepMeta, build_step_meta, meta_diagnostics
 
 
 def _normalize_within_groups(
@@ -56,6 +60,15 @@ class GiGPO(CreditAssignmentMethod):
         cfg = GiGPOConfig.from_params(params)
         if inputs.step_spans is None or inputs.step_observations is None:
             raise ValueError("GiGPO requires step_spans and step_observations in CreditAssignmentInput")
+        transitions = inputs.extra.get("step_transitions")
+        if cfg.anchor == ANCHOR_MODE_STATE and transitions is None:
+            # 不静默退化为 observation anchor: 那样会得出"看起来是 state 实验、实际是
+            # observation 实验"的结果. 要么开采集, 要么显式 anchor=observation.
+            raise ValueError(
+                "GiGPO anchor='state' requires rollout metadata 'ca_step_transitions' "
+                "(set algorithm.credit_assignment.collect_step_states=true, or use "
+                "params.anchor='observation' for the observation-based baseline)."
+            )
         bs = inputs.batch_size
         response_length = inputs.response_length
         device = inputs.assistant_mask.device
@@ -74,18 +87,33 @@ class GiGPO(CreditAssignmentMethod):
         )  # (bs,)
 
         # 展平所有 step entry: (row, step_index_in_row). anchor 三态: INITIAL/OBSERVED/INVALID.
+        # anchor 键与 step 有效性判定共用 state_meta (单一分类来源, 避免两侧分叉).
         step_row: list[int] = []
         step_idx: list[int] = []
         step_anchor_fp: list[str] = []
+        step_truncated: list[bool] = []
+        meta_rows: list[list[StepMeta]] = []
+        initial_states = inputs.extra.get("initial_states") or [None] * bs
+        terminal_reasons = inputs.extra.get("terminal_reasons") or [None] * bs
         for row in range(bs):
             spans = inputs.step_spans[row] or []
             obs = inputs.step_observations[row] or []
-            n_steps = len(spans)
-            for k in range(n_steps):
+            trans_row = transitions[row] if transitions is not None else None
+            metas = build_step_meta(
+                spans=spans,
+                response_length=response_length,
+                anchor_mode=cfg.anchor,
+                transitions_row=trans_row,
+                observations_row=obs,
+                initial_state=initial_states[row] if row < len(initial_states) else None,
+                terminal_reason=terminal_reasons[row] if row < len(terminal_reasons) else None,
+            )
+            meta_rows.append(metas)
+            for meta in metas:
                 step_row.append(row)
-                step_idx.append(k)
-                raw = obs[k] if k < len(obs) else None
-                step_anchor_fp.append(fingerprint_anchor(raw))
+                step_idx.append(meta.index)
+                step_anchor_fp.append(meta.anchor_fp)
+                step_truncated.append(meta.truncated)
 
         num_steps = len(step_row)
 
@@ -115,8 +143,15 @@ class GiGPO(CreditAssignmentMethod):
         # --- Eq.6 + Eq.7: anchor grouping 内对 discounted return 归一化. ---
         # INVALID anchor: 不与其他 step 分组, step advantage 直接为 0 (仅保留 episode 部分);
         # 避免把"观测缺失"当作同一状态而误归组 (也不当作初始状态).
+        # include_truncated_in_baseline=False 时, 被截断 step 也不参与分组 (其 A_S=0);
+        # 默认 True, 保持与现有实现完全一致的 baseline 数值.
         step_adv = np.zeros(num_steps, dtype=np.float64)
-        valid = [p for p in range(num_steps) if step_anchor_fp[p] != INVALID_FINGERPRINT]
+        valid = [
+            p
+            for p in range(num_steps)
+            if step_anchor_fp[p] != INVALID_FINGERPRINT
+            and (cfg.include_truncated_in_baseline or not step_truncated[p])
+        ]
         if valid:
             group_keys_map = build_step_groups(uids, [(step_row[p], step_anchor_fp[p]) for p in valid])
             group_keys = [group_keys_map[local] for local, p in enumerate(valid)]
@@ -151,4 +186,9 @@ class GiGPO(CreditAssignmentMethod):
         # tool observation token / padding 已在 assistant_mask 处被置 0.
         advantages = advantages * (inputs.assistant_mask > 0).to(advantages.dtype)
 
-        return CreditAssignmentOutput(advantages=advantages, returns=advantages)
+        metrics = meta_diagnostics(meta_rows)
+        metrics["baseline_excluded_truncated"] = 0.0 if cfg.include_truncated_in_baseline else 1.0
+        if num_steps:
+            metrics["step_adv_nonzero_frac"] = float(np.count_nonzero(step_adv)) / num_steps
+            metrics["anchor_group_count"] = float(len({step_anchor_fp[p] for p in valid}))
+        return CreditAssignmentOutput(advantages=advantages, returns=advantages, metrics=metrics)

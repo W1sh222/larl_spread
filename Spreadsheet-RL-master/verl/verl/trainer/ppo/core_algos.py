@@ -476,12 +476,18 @@ def compute_credit_assignment_advantage(
     config: Optional[AlgoConfig] = None,
     non_tensor_batch: Optional[dict] = None,
     batch: Optional[dict] = None,
+    metrics_out: Optional[dict] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Credit Assignment Library 的通用 adapter (单一 estimator 入口).
 
     从 config.algorithm.credit_assignment 读取 method 名与 params, 转交独立库计算
     token-level advantage. 新增 credit assignment 算法只需在库中注册, 无需改本函数.
+
+    Args:
+        metrics_out: 可选的旁路 dict. 调用方 (ray_trainer.compute_advantage) 对所有
+            non-GAE/GRPO estimator 统一按 2-tuple 解包, 因此诊断量只能通过可变容器
+            传出, 不能塞进返回值. 不传时行为与之前完全一致.
     """
     assert config is not None, "credit_assignment 需要 algorithm config"
     assert non_tensor_batch is not None, "credit_assignment 需要 non_tensor_batch (step metadata)"
@@ -503,6 +509,12 @@ def compute_credit_assignment_advantage(
         non_tensor_batch=non_tensor_batch,
         params=dict(params),
     )
+
+    if metrics_out is not None:
+        # 加 method 前缀, 避免不同库方法的同名指标互相覆盖.
+        for key, value in (result.metrics or {}).items():
+            metrics_out[f"credit_assignment/{method}/{key}"] = float(value)
+
     return result.advantages, result.returns
 
 

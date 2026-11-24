@@ -48,10 +48,15 @@ class CreditAssignmentInput:
 
 @dataclass
 class CreditAssignmentOutput:
-    """标准输出: PPO 可直接使用的 token-level advantage."""
+    """标准输出: PPO 可直接使用的 token-level advantage.
+
+    metrics 为可选诊断量 (纯 float, 前缀由调用方决定); 不参与训练数值,
+    仅用于区分 anchor 类型 / step 有效性等实验对照指标.
+    """
 
     advantages: torch.Tensor  # (bs, response_length)
     returns: torch.Tensor  # (bs, response_length)
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 class CreditAssignmentMethod(ABC):

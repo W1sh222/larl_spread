@@ -162,10 +162,14 @@ def _normalize_primary_ext(extra_info: Any) -> str:
 
 
 def _resolve_collect_step_states(config: Any) -> bool:
-    """structured state transition 采集开关 (RewardFlow 用).
+    """structured state transition 采集开关 (RewardFlow / GiGPO state anchor 用).
 
     显式 algorithm.credit_assignment.collect_step_states 优先;
-    未配置时按 method == "rewardflow" 自动启用, 杜绝 "选了 rewardflow 但没采集".
+    未配置时自动启用条件:
+      - method == "rewardflow": 需要 pre/post 状态, 杜绝 "选了 rewardflow 但没采集";
+      - method == "gigpo" 且 params.anchor == "state" (默认): Eq.7 的 anchor 是
+        pre-action full workbook fingerprint, 没有 transitions 时 gigpo 会直接 raise,
+        不允许静默退化成 observation anchor (两种 anchor 分组语义不同).
     """
     try:
         ca = config.get("algorithm", None) if hasattr(config, "get") else None
@@ -178,7 +182,13 @@ def _resolve_collect_step_states(config: Any) -> bool:
         explicit = ca.get("collect_step_states", None)
         if explicit is not None:
             return bool(explicit)
-        return ca.get("method", None) == "rewardflow"
+        method = ca.get("method", None)
+        if method == "rewardflow":
+            return True
+        if method == "gigpo":
+            params = ca.get("params", None) or {}
+            return str(params.get("anchor", "state")) == "state"
+        return False
     except Exception:
         return False
 
