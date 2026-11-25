@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import stat
+import zipfile
 from collections import OrderedDict
 from enum import Enum
 from pathlib import Path
@@ -155,6 +156,27 @@ def _atomic_copy_file(src: Path, dest: Path) -> None:
                 shutil.rmtree(tmp_dest)
         except OSError:
             pass
+
+
+def _snapshot_workspace_workbook(workspace_id: Any, primary_ext: str = ".xlsx") -> None:
+    """Keep a copy of the newest readable workbook for rollback after a corrupt write."""
+    workspace_id = normalize_workspace_id(workspace_id)
+    if workspace_id is None:
+        return
+    workspace_dir = get_spreadsheet_rl_data_root() / "_workspaces" / workspace_id
+    if not workspace_dir.is_dir():
+        return
+    for candidate in (f"output{primary_ext}", f"data{primary_ext}"):
+        source = workspace_dir / candidate
+        if not source.is_file():
+            continue
+        try:
+            if not zipfile.is_zipfile(source):
+                continue
+            _atomic_copy_file(source, workspace_dir / f".{source.stem}.last_good{source.suffix}")
+        except Exception:
+            continue
+        return
 
 
 def _normalize_primary_ext(extra_info: Any) -> str:
@@ -695,6 +717,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await self._execute_tool_calls(tool_calls, agent_data.tools_kwargs, agent_data)
+        _snapshot_workspace_workbook(getattr(agent_data, "request_id", None))
         if serial_overflow_tool_calls:
             message = (
                 "Error: tool call not executed because this turn contains write-capable tools and "

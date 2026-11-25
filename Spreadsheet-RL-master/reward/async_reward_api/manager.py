@@ -45,6 +45,7 @@ from .config import (
     _get_poll_interval_s,
     _get_quarantine_sweep_interval_s,
     _get_sqlite_executor_workers,
+    _get_stale_queued_s,
     _get_stale_sweep_leader_lease_s,
     _get_windows_excel_diagnostics_dir,
     _get_windows_excel_diagnostics_root,
@@ -367,6 +368,18 @@ class RewardJobManager:
         try:
             await self._run_store(self._store.init)
             await self._sweep_stale_running_jobs_once(pass_now_s=time.time())
+            stale_queued_s = _get_stale_queued_s()
+            if stale_queued_s > 0:
+                try:
+                    purged = await self._run_store(
+                        self._store.mark_stale_queued_as_error,
+                        older_than_s=stale_queued_s,
+                        msg="stale queued job purged on startup",
+                    )
+                    if purged:
+                        logger.warning(f"[main] purged {purged} stale queued job(s) older than {stale_queued_s}s")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[main] stale queued job purge failed: {_format_exception(exc)}")
             if (
                 self._platform is Platform.WINDOWS
                 and os.name == "nt"

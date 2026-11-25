@@ -254,7 +254,9 @@ tools:
       deduplicate_successful_calls: true
       lock_timeout_s: 30
       recalc_url: "${oc.env:SPREADSHEET_RL_RECALC_URL,http://127.0.0.1:5000/recalculate}"
-      recalc_timeout_s: 180
+      # 服务端 REWARD_API_WORKER_TIMEOUT_S=240s 会杀掉卡住的 Excel；这里留 60s 余量，
+      # 避免客户端先超时放弃、服务端还在为已被丢弃的任务空算。
+      recalc_timeout_s: 300
       max_response_chars: 4096
 
     tool_schema:
@@ -294,7 +296,9 @@ tools:
       max_iter_cells: 50000
       max_scan_cells: 500000
       recalc_url: "${oc.env:SPREADSHEET_RL_RECALC_URL,http://127.0.0.1:5000/recalculate}"
-      recalc_timeout_s: 180
+      # 服务端 REWARD_API_WORKER_TIMEOUT_S=240s 会杀掉卡住的 Excel；这里留 60s 余量，
+      # 避免客户端先超时放弃、服务端还在为已被丢弃的任务空算。
+      recalc_timeout_s: 300
       max_response_chars: 4096
 
     tool_schema:
@@ -324,7 +328,9 @@ tools:
       lock_timeout_s: 30
       max_delete_rows: 10000
       recalc_url: "${oc.env:SPREADSHEET_RL_RECALC_URL,http://127.0.0.1:5000/recalculate}"
-      recalc_timeout_s: 180
+      # 服务端 REWARD_API_WORKER_TIMEOUT_S=240s 会杀掉卡住的 Excel；这里留 60s 余量，
+      # 避免客户端先超时放弃、服务端还在为已被丢弃的任务空算。
+      recalc_timeout_s: 300
 
     tool_schema:
       type: "function"
@@ -355,7 +361,9 @@ tools:
       lock_timeout_s: 30
       max_delete_cols: 1000
       recalc_url: "${oc.env:SPREADSHEET_RL_RECALC_URL,http://127.0.0.1:5000/recalculate}"
-      recalc_timeout_s: 180
+      # 服务端 REWARD_API_WORKER_TIMEOUT_S=240s 会杀掉卡住的 Excel；这里留 60s 余量，
+      # 避免客户端先超时放弃、服务端还在为已被丢弃的任务空算。
+      recalc_timeout_s: 300
 
     tool_schema:
       type: "function"

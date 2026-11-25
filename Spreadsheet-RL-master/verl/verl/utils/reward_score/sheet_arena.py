@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -19,6 +20,14 @@ from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir,
 _DEFAULT_SPREADSHEET_RL_REWARD_TIMEOUT_S = 10800.0  # 3 hours minus buffer
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _is_readable_workbook(path: Path) -> bool:
+    """True when ``path`` is a non-empty zip container (an xlsx is a zip)."""
+    try:
+        return path.is_file() and path.stat().st_size > 0 and zipfile.is_zipfile(path)
+    except OSError:
+        return False
 
 _spreadsheet_rl_reward_semaphore: threading.BoundedSemaphore | None = None
 _spreadsheet_rl_reward_semaphore_initialized = False
@@ -201,7 +210,23 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
                 payload_file = data_file
 
         if not payload_file.exists():
+            logger.warning("reward_skip thread_dir=%s reason=no_payload", thread_dir)
             return _result(0.0)
+
+        # A truncated workbook cannot be scored, so roll back to the newest
+        # snapshot that was still a readable zip (written after each tool turn).
+        if not _is_readable_workbook(payload_file):
+            snapshot = payload_file.with_name(f".{payload_file.stem}.last_good{payload_file.suffix}")
+            if _is_readable_workbook(snapshot):
+                logger.warning(
+                    "reward_fallback thread_dir=%s reason=corrupt_payload fallback=%s",
+                    thread_dir,
+                    snapshot.name,
+                )
+                payload_file = snapshot
+            else:
+                logger.warning("reward_skip thread_dir=%s reason=corrupt_payload", thread_dir)
+                return _result(0.0)
 
         filename = payload_file.name
         mime_type = (
@@ -360,6 +385,8 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
                 except Exception:
                     reward = 0.0
                 msg = poll_payload.get("msg", "")
+                if status == "error":
+                    logger.warning("reward_service_error thread_dir=%s msg=%s", thread_dir, str(msg or "")[:200])
                 return _result(reward, str(msg or ""))
 
             # Still queued/running; if we didn't long-poll, add client-side pacing.

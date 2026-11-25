@@ -8,6 +8,7 @@ import json
 import math
 import mimetypes
 import os
+import random
 import re
 import stat
 import tempfile
@@ -148,6 +149,32 @@ def _get_submit_retry_interval_s() -> float:
         return max(0.1, retry_s)
     except ValueError:
         return 20.0
+
+
+def _get_max_concurrent_recalc() -> int:
+    value = os.environ.get("SHEET_ARENA_RECALC_MAX_CONCURRENT", "8")
+    try:
+        n = int(value)
+    except ValueError:
+        return 8
+    return min(max(1, n), 256)
+
+
+_RECALC_SEMAPHORES: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Semaphore]] = {}
+
+
+def _get_recalc_semaphore() -> asyncio.Semaphore:
+    """按事件循环复用信号量，限制单进程同时上传的工作簿数量。
+
+    每个 AgentLoopWorker 进程都会把超时/重试中的请求堆在 asyncio 默认线程池里，
+    高并发时会把上百个完整工作簿同时推给 Windows 侧，造成上传风暴。
+    """
+    loop = asyncio.get_running_loop()
+    entry = _RECALC_SEMAPHORES.get(id(loop))
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Semaphore(_get_max_concurrent_recalc()))
+        _RECALC_SEMAPHORES[id(loop)] = entry
+    return entry[1]
 
 
 def _get_max_read_cells() -> int:
@@ -975,6 +1002,18 @@ def _post_recalculate(
 
     deadline_s = time.monotonic() + float(timeout_s)
     submit_retry_interval_s = _get_submit_retry_interval_s()
+    retry_s = submit_retry_interval_s
+
+    def _sleep_before_retry(remaining_s: float) -> None:
+        """指数退避 + 抖动。
+
+        固定 20s 重试会让上千个 rollout 在同一秒同时重传整个工作簿（惊群），
+        对 Windows 侧形成周期性写盘峰值；抖动把峰值摊平，退避上限 60s。
+        """
+        nonlocal retry_s
+        delay_s = min(retry_s, max(0.0, remaining_s), 60.0)
+        time.sleep(delay_s * (0.75 + random.random() * 0.5))
+        retry_s = min(retry_s * 2.0, 60.0)
 
     job_id: str
     submit_parts = urllib.parse.urlsplit(url)
@@ -1027,7 +1066,7 @@ def _post_recalculate(
         try:
             with opener.open(req, timeout=submit_timeout_s) as resp:
                 if not _is_success_status(resp.status):
-                    time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+                    _sleep_before_retry(remaining_s)
                     continue
                 content_type = (resp.headers.get("Content-Type") or "").lower()
                 resp_bytes = resp.read(max_response_bytes + 1)
@@ -1050,10 +1089,10 @@ def _post_recalculate(
                     body = body[:2000]
                     raise RuntimeError(f"recalculate submit failed with HTTP {status}: {body}") from None
                 raise RuntimeError(f"recalculate submit failed with HTTP {status}") from None
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
         except (urllib.error.URLError, OSError, TimeoutError):
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
 
         if "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in content_type:
@@ -1064,19 +1103,19 @@ def _post_recalculate(
         try:
             payload = json.loads(resp_bytes.decode("utf-8", errors="replace"))
         except ValueError:
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
         if not isinstance(payload, dict):
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
 
         if payload.get("status") == "busy":
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
 
         job_id_raw = payload.get("job_id")
         if not isinstance(job_id_raw, str) or not job_id_raw:
-            time.sleep(min(submit_retry_interval_s, max(0.0, remaining_s)))
+            _sleep_before_retry(remaining_s)
             continue
         job_id = job_id_raw
         break
@@ -1400,14 +1439,15 @@ class RecalculateAndReadTool(BaseTool):
             )
 
         try:
-            content = await asyncio.to_thread(
-                _post_recalculate,
-                url=self.recalc_url,
-                file_bytes=request_bytes,
-                filename=target_file.name,
-                timeout_s=self.timeout_s,
-                max_response_bytes=self.max_file_size_bytes,
-            )
+            async with _get_recalc_semaphore():
+                content = await asyncio.to_thread(
+                    _post_recalculate,
+                    url=self.recalc_url,
+                    file_bytes=request_bytes,
+                    filename=target_file.name,
+                    timeout_s=self.timeout_s,
+                    max_response_bytes=self.max_file_size_bytes,
+                )
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
             return (
                 ToolResponse(text=f"Error: recalculate request failed: {exc}"),

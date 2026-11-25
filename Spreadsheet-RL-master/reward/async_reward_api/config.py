@@ -117,6 +117,15 @@ def _get_max_queue_size() -> int:
     return env_int("REWARD_API_MAX_QUEUE_SIZE", 3000, lo=1)
 
 
+def _get_max_inflight_uploads() -> int:
+    """同时处理中的上传请求上限。
+
+    Starlette 会在进入路由函数前把整个 multipart 请求体 spool 到临时目录，
+    因此队列检查必须提前到请求体读取之前，否则「拒绝」挡不住写盘。
+    """
+    return env_int("REWARD_API_MAX_INFLIGHT_UPLOADS", 8, lo=1, hi=256)
+
+
 def _get_cleanup_batch_size() -> int:
     return env_int("REWARD_API_CLEANUP_BATCH_SIZE", 512, lo=1, hi=10000)
 
@@ -265,3 +274,17 @@ def _get_max_running_jobs() -> int | None:
     except ValueError:
         return None
     return max(1, n)
+
+
+def _get_stale_queued_s() -> float:
+    """启动时清理排队超过该秒数、从未被领取的任务；<=0 表示不清理。"""
+    value = os.environ.get("REWARD_API_STALE_QUEUED_S")
+    if value is None or not value.strip():
+        return 600.0
+    try:
+        seconds = float(value)
+    except ValueError:
+        return 600.0
+    if not math.isfinite(seconds):
+        return 600.0
+    return seconds

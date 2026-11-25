@@ -1268,6 +1268,32 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
+    def _initial_val_cache_path(self):
+        return os.path.join(self.config.trainer.default_local_dir, "initial_val_cache.json")
+
+    def _initial_val_cache_key(self):
+        """初始验证缓存键：底座权重与验证解码配置一致时，验证结果可复用。"""
+        import hashlib
+
+        from omegaconf import OmegaConf
+
+        cfg = self.config
+        val_files = cfg.data.get("val_files")
+        if isinstance(val_files, str):
+            val_files = [val_files]
+        sig = {
+            "model_path": cfg.actor_rollout_ref.model.path,
+            "lora_rank": cfg.actor_rollout_ref.model.get("lora_rank", 0),
+            "lora_alpha": cfg.actor_rollout_ref.model.get("lora_alpha", 0),
+            "val_files": list(val_files) if val_files else [],
+            "max_prompt_length": cfg.data.get("max_prompt_length"),
+            "max_response_length": cfg.data.get("max_response_length"),
+            "val_batch_size": cfg.data.get("val_batch_size"),
+            "val_kwargs": OmegaConf.to_container(cfg.actor_rollout_ref.rollout.val_kwargs, resolve=True),
+            "reward_manager": cfg.get("reward_manager", {}).get("name") if cfg.get("reward_manager") else None,
+        }
+        return hashlib.sha256(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1297,7 +1323,29 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            # 仅当从底座权重（global_steps==0）开始且未强制重算时，复用同配置的初始验证结果
+            cache_key = self._initial_val_cache_key() if self.global_steps == 0 else None
+            cache_path = self._initial_val_cache_path() if cache_key else None
+            val_metrics = None
+            if cache_key and os.environ.get("FORCE_VAL", "0") != "1" and os.path.exists(cache_path):
+                try:
+                    with open(cache_path, encoding="utf-8") as f:
+                        cached = json.load(f)
+                except (OSError, ValueError):
+                    cached = None
+                if cached and cached.get("key") == cache_key:
+                    val_metrics = cached.get("metrics")
+                    pprint(f"[val-cache] 复用初始验证结果：{cache_path}")
+            if val_metrics is None:
+                val_metrics = self._validate()
+                if cache_key:
+                    try:
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump({"key": cache_key, "metrics": val_metrics}, f, ensure_ascii=False, indent=2, default=float)
+                        pprint(f"[val-cache] 已保存初始验证结果：{cache_path}")
+                    except (OSError, TypeError, ValueError) as e:
+                        print(f"[val-cache] 写缓存失败，忽略：{e}")
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)

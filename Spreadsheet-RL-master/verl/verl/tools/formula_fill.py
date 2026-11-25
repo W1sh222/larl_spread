@@ -24,6 +24,7 @@ from .base_tool import BaseTool
 from .formula_fill_core import fill_formula, normalize_formula_for_excel, validate_formula_for_excel
 from .recalculate import _post_recalculate, _read_workbook_signature_under_lock_sync, _scan_zip_metadata_bytes
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
+from .workbook_formula_cache import save_workbook_atomically
 from .worksheet_resolution import resolve_worksheet as _resolve_target_worksheet
 
 _EXCEL_MAX_ROWS = 1_048_576
@@ -671,7 +672,7 @@ def _fill_formula_in_workbook_unlocked_sync(
             formula_template=formula_template,
         )
 
-        wb.save(str(file_path))
+        save_workbook_atomically(wb, file_path)
         return resolved_sheet_name, filled_cells, skipped_merged_cells
     finally:
         if wb is not None:

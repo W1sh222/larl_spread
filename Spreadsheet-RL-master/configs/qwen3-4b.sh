@@ -20,7 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR=${PROJECT_DIR:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}
 export RAY_DATA_HOME=${RAY_DATA_HOME:-"${PROJECT_DIR}/verl_data"}
 MODEL_PATH=${MODEL_PATH:-"${SPREADSHEET_RL_MODEL_REPO_ID:-${MODEL_REPO_ID:-Qwen/Qwen3-4B-Thinking-2507}}"}
-CKPTS_DIR=${CKPTS_DIR:-"${PROJECT_DIR}/checkpoints/${project_name}/${exp_name}"}
+# checkpoint 体积大（LoRA 也存全量 base），统一落到共享盘，避免写满根分区（/ 仅剩约 260G）
+CKPT_ROOT=${CKPT_ROOT:-/remote-home/share/yichengfu/checkpoints}
+CKPTS_DIR=${CKPTS_DIR:-"${CKPT_ROOT}/${project_name}/${exp_name}"}
 SPREADSHEET_RL_DATA_ROOT=${SPREADSHEET_RL_DATA_ROOT:-"${PROJECT_DIR}/data"}
 TRAIN_FILE=${TRAIN_FILE:-"${SPREADSHEET_RL_DATA_ROOT}/train_hermes.parquet"}
 TEST_FILE=${TEST_FILE:-"${SPREADSHEET_RL_DATA_ROOT}/test_hermes.parquet"}
@@ -116,7 +118,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=65536 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=65536 \
     algorithm.use_kl_in_reward=False \
-    +reward.max_concurrent=4 \
+    +reward.max_concurrent=8 \
     +reward.timeout=10800 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \

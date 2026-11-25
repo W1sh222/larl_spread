@@ -49,6 +49,7 @@ from .schemas import OpenAIFunctionToolSchema, ToolResponse
 from .workbook_formula_cache import (
     _collect_formula_cached_values_from_xlsx,
     _restore_formula_cached_values_in_xlsx,
+    save_workbook_atomically,
 )
 
 _A1_CELL_RE = r"[A-Z]{1,3}[0-9]{1,7}"
@@ -595,7 +596,7 @@ def _write_range_in_workbook_unlocked_sync(
                 "data contains no cells to write (all null/merged-skipped).",
             )
 
-        wb.save(str(file_path))
+        save_workbook_atomically(wb, file_path)
         formula_cache_preserved = True
         try:
             _restore_formula_cached_values_in_xlsx(file_path, cached_formula_values)

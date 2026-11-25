@@ -407,6 +407,44 @@ def _list_excel_pids(platform: Platform) -> set[int] | None:
         return None
 
 
+def _list_orphan_excel_pids(platform: Platform) -> set[int] | None:
+    """返回父进程已退出的 EXCEL.EXE PID。
+
+    Windows 不会把孤儿进程重新挂到 init 上，父 PID 会保留。因此「父进程不存在」
+    可以精确识别上一次服务崩溃/重启遗留的 Excel，而不会误伤其它存活 worker 的实例。
+    """
+    if platform is not Platform.WINDOWS:
+        return set()
+    script = (
+        "$ps = Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ParentProcessId; "
+        "$ids = @($ps.ProcessId); "
+        "$ps | Where-Object { $_.Name -eq 'EXCEL.EXE' -and ($ids -notcontains $_.ParentProcessId) } "
+        "| ForEach-Object { $_.ProcessId }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_run_kwargs_no_window(),
+        )
+        pids: set[int] = set()
+        for line in (completed.stdout or "").splitlines():
+            value = line.strip()
+            if value.isdigit():
+                pids.add(int(value))
+        return pids
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        return None
+
+
 def _kill_new_excel_processes(*, platform: Platform, baseline_pids: set[int] | None) -> int:
     if baseline_pids is None:
         return 0

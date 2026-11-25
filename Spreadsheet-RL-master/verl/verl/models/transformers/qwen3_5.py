@@ -215,9 +215,24 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     fused_linear_for_ppo = FusedLinearForPPO()
+    vocab_weights = self.lm_head.weight
+    # Under FSDP2 / TP, lm_head.weight is a DTensor sharded on the vocab dim.
+    # The custom autograd Function below performs a raw `hidden @ weight.t()`
+    # matmul that bypasses the nn.Module pre-forward all-gather hook (which only
+    # fires for self.lm_head(hidden_states)), so we must materialize the full
+    # weight first. Mirrors verl's own pattern in
+    # workers/engine/automodel/transformer_impl.py (logits.full_tensor()).
+    # Memory-neutral: the non-fused self.lm_head() path all-gathers the same
+    # weight via the FSDP2 hook; backward scatters grads back to the shard.
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:  # pragma: no cover - older torch without DTensor
+        DTensor = None
+    if DTensor is not None and isinstance(vocab_weights, DTensor):
+        vocab_weights = vocab_weights.full_tensor()
     log_probs, entropy = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
-        vocab_weights=self.lm_head.weight,
+        vocab_weights=vocab_weights,
         input_ids=rolled_labels,
         temperature=temperature,
     )
