@@ -43,7 +43,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 原因：vLLM 0.32 删除了 `FusedMoE` 类，而 verl 只在 `isinstance` 判断里用到它。
 
 处理：已在本仓库补丁中加入降级占位类型，见
-[verl/utils/vllm/vllm_fp8_utils.py](file:///remote-home/yichengfu/larl/Spreadsheet-RL-master/verl/verl/utils/vllm/vllm_fp8_utils.py#L22-L35)：
+[verl/utils/vllm/vllm_fp8_utils.py](../Spreadsheet-RL-master/verl/verl/utils/vllm/vllm_fp8_utils.py#L22-L35)：
 
 ```python
 try:
@@ -67,7 +67,7 @@ except ImportError:
 症状：`ModuleNotFoundError: flash_attn`。
 
 处理：已在本仓库补丁中让 `attention_utils` 回退到 verl 自带的纯 PyTorch 等价实现，见
-[verl/utils/attention_utils.py](file:///remote-home/yichengfu/larl/Spreadsheet-RL-master/verl/verl/utils/attention_utils.py#L26-L39)。
+[verl/utils/attention_utils.py](../Spreadsheet-RL-master/verl/verl/utils/attention_utils.py#L26-L39)。
 
 ### `openai` 版本不兼容
 
@@ -142,7 +142,7 @@ pkill -f "verl.trainer.main_pp[o]"   # 连带结束 raylet 与 vLLM worker，释
 原因：`llm_api.py` 里 `max_tokens` 未设置，取服务端默认值。
 
 处理：已改为显式 `max_tokens=8192`，见
-[inference/llm_api.py](file:///remote-home/yichengfu/larl/SpreadsheetBench/inference/llm_api.py#L4-L14)。
+[inference/llm_api.py](../SpreadsheetBench/inference/llm_api.py#L4-L14)。
 
 ### 评测结果全部 0 分
 
@@ -152,7 +152,7 @@ pkill -f "verl.trainer.main_pp[o]"   # 连带结束 raylet 与 vLLM worker，释
 proc_path = f"{dataset_path}/outputs/{opt.setting}_{opt.model}/{test_case_idx + 1}_{data['id']}_output.xlsx"
 ```
 
-见 [evaluation.py](file:///remote-home/yichengfu/larl/SpreadsheetBench/evaluation/evaluation.py#L213-L216)。
+见 [evaluation.py](../SpreadsheetBench/evaluation/evaluation.py#L213-L216)。
 
 ### `KeyError` / 找不到 `/mnt/data/...`
 
@@ -161,7 +161,7 @@ proc_path = f"{dataset_path}/outputs/{opt.setting}_{opt.model}/{test_case_idx + 
 处理：
 
 ```bash
-sudo ln -sfn /remote-home/yichengfu/larl/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
+sudo ln -sfn <path-to>/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
 ```
 
 同时确保 `data/<dataset>/outputs/single_<model>/` 目录存在（`code_exec_docker` 原实现会 chmod 777，本地版没有该逻辑）。
@@ -220,7 +220,7 @@ icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r `
 
 排查顺序：
 
-1. `ping 172.16.6.155`、`Test-NetConnection`（Windows 侧需允许 ICMP）
+1. `ping <windows-host>`、`Test-NetConnection`（Windows 侧需允许 ICMP）
 2. Windows 上 `Get-NetTCPConnection -LocalPort 22 -State Listen`
 3. 若本机监听正常、防火墙放行但仍不通，多半是**校园网 ACL 禁止了跨网段访问**；此时只能走由 Windows 主动外连的反向隧道，或换到同网段部署。
 

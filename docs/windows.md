@@ -5,7 +5,7 @@ Windows 主机承担两件事，**都依赖 Microsoft Excel COM，都必须在�
 1. `SRL-RewardAPI`：GRPO 训练用的奖励 / 重算 HTTP 服务（端口 5000）
 2. `SBT-Recalc`：SpreadsheetBench 的 GT 批量重算队列（按需触发）
 
-本机实测环境：Windows 10 教育版，用户 `fyclab`（管理员），Office 16 (`C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE`)，内部地址 `172.16.6.155`。
+本机实测环境：Windows 10，管理员账户，Office 16 (`C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE`)；下文用 `<windows-host>` / `<windows-user>` 指代主机地址与账户名。
 
 ## 1. 部署位置
 
@@ -46,7 +46,7 @@ uv sync --locked          # 或  python -m venv .venv; .venv\Scripts\pip install
 # Linux → Windows（在 Linux 上执行）
 tar -czf srl_meta.tgz -C Spreadsheet-RL-master/data \
     domain excelforum spreadsheetbench spreadsheetbench_2 spreadsheetbench_verified
-scp srl_meta.tgz fyclab@172.16.6.155:E:/SpreadsheetRL/
+scp srl_meta.tgz <windows-user>@<windows-host>:E:/SpreadsheetRL/
 # Windows 上解压到 E:\SpreadsheetRL\data
 ```
 
@@ -76,7 +76,7 @@ Start-ScheduledTask -TaskName 'SRL-RewardAPI'
 服务健康检查（Linux 侧）：
 
 ```bash
-curl -s http://172.16.6.155:5000/health
+curl -s http://<windows-host>:5000/health
 ```
 
 主要接口：
@@ -121,41 +121,31 @@ Start-ScheduledTask -TaskName 'SBT-Recalc'
 
 失败不中断：单个目录报错只写日志，继续下一个。
 
-## 6. SSH 访问（给别人用的密钥）
+## 6. SSH 访问
 
-### 6.1 密钥位置
+### 6.1 生成密钥
 
-```
-/remote-home/share/yichengfu/larl_spread/ssh_key/
-├── id_ed25519        # 私钥（600，仅 root 可读）
-└── id_ed25519.pub    # 公钥
-```
-
-公钥内容：
-
-```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHgPrILRZzRfbZ15LEuCy8cUKyfg54JzkQBmP1PUfq89 larl_spread-windows-access
+```bash
+ssh-keygen -t ed25519 -f ./id_ed25519 -C "spreadsheet-rl-windows-access"
+ssh -i ./id_ed25519 <windows-user>@<windows-host> 'echo OK; hostname'
 ```
 
-该公钥**已导入** Windows 的 `C:\ProgramData\ssh\administrators_authorized_keys`，持有对应私钥即可免密登录。
+把 `id_ed25519.pub` 的内容追加到 Windows 的 `C:\ProgramData\ssh\administrators_authorized_keys`（管理员账户读的是这个文件，见 6.4）。
 
 ### 6.2 使用
 
 ```bash
 chmod 600 id_ed25519
-ssh -i ./id_ed25519 fyclab@172.16.6.155
-# 验证
-ssh -i ./id_ed25519 fyclab@172.16.6.155 'echo OK; hostname'
+ssh -i ./id_ed25519 <windows-user>@<windows-host>
 ```
 
 默认 shell 是 PowerShell，可直接执行 PowerShell 命令；文件传输用 `scp -i ./id_ed25519`。
 
 ### 6.3 给别人用之前必须知道
 
-- 私钥当前权限 600 / 属主 root。要交付给他人，请**复制一份**并 `chown` 给对方，或让对方自己生成密钥、把公钥发给你追加到 `administrators_authorized_keys`（更推荐，便于单独吊销）。
-- 该密钥对应的是 **Windows 管理员账户 `fyclab`**，即拥有目标机器完整管理员权限。不要把私钥放到公开仓库、聊天群或共享目录的 world-readable 位置。
+- 私钥不要放进公开仓库、聊天群或共享目录的 world-readable 位置。
+- 该密钥对应的是 **Windows 管理员账户**，即拥有目标机器完整管理员权限。
 - 吊销：编辑 `C:\ProgramData\ssh\administrators_authorized_keys` 删除对应行即可，无需重启服务。
-- Linux 侧 `~/.ssh/id_ed25519`（`larl-agent`）是另一把**旧的**运维密钥，与这把无关。
 
 ### 6.4 Windows SSH 服务（重装时参考）
 

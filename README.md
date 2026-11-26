@@ -34,7 +34,7 @@
 | conda 环境 `spread` | Linux | Python 3.11.18，verl 0.8.0.dev + torch 2.13.0+cu129 + vllm 0.32.0 |
 | conda 环境 `sandbox` | Linux | Python 3.11.18，SandboxFusion 代码执行服务 |
 | conda 环境 `vllm` | Linux | Python 3.12.16，vllm 0.32.0（仅评测链路用） |
-| 模型 | Linux | `/remote-home/yichengfu/models/Qwen3-4B-Thinking-2507`、`Qwen3.5-9B` |
+| 模型 | Linux | 本地目录（`MODEL_PATH` 指定），如 `Qwen3-4B-Thinking-2507`、`Qwen3.5-9B` |
 | 重算/奖励服务 | Windows | Python 3.11.9 venv，Excel COM，端口 5000 |
 
 > ⚠️ 数据集（约 6.6GB）与模型权重**不在本仓库内**，`.gitignore` 已排除。获取方式见 [docs/environment.md](docs/environment.md)。
@@ -56,6 +56,7 @@
 - [docs/train-pipeline.md](docs/train-pipeline.md)：Spreadsheet-RL GRPO 训练链路
 - [docs/windows.md](docs/windows.md)：Windows 侧服务部署、SSH 密钥、计划任务
 - [docs/troubleshooting.md](docs/troubleshooting.md)：**踩坑记录**（部署时踩过的坑与修法）
+- [docs/compatibility_matrix.md](docs/compatibility_matrix.md)：参考环境兼容矩阵与版本选择依据
 
 ## 部署脚本
 
@@ -66,6 +67,7 @@ Spreadsheet-RL-master/deploy/
 ├── env.sh                   # 环境变量（服务地址、PYTHONPATH、flashinfer 开关）
 ├── serve_sandbox.sh         # 起 SandboxFusion 代码执行服务 :8080
 ├── run_grpo.sh              # 起 GRPO 训练（自动套 A100 适配参数）
+├── export_final_hf.sh       # 把最终 FSDP checkpoint 合并成 HF BF16（CPU 即可）
 ├── win_install_reward_task.ps1  # 注册 Windows 交互式计划任务
 └── win_start_reward_api.ps1     # Windows 奖励服务实际启动入口
 
@@ -77,6 +79,6 @@ SpreadsheetBench/deploy/
 ## 关键前提
 
 1. **Windows 主机必须保持登录状态**（锁屏可以，注销/关机会让 Excel COM 失效）。这是整个训练链路的硬约束。
-2. Linux 与 Windows 需在同一内网互通（本例 `172.16.6.155:5000`）。
+2. Linux 与 Windows 需在同一内网互通（奖励服务地址用 `SPREADSHEET_RL_REWARD_URL` / `SPREADSHEET_RL_RECALC_URL` 指定）。
 3. A100 不支持 FlashAttention-3，训练必须用 `sdpa`，脚本已默认处理。
 4. 训练数据需先在本地生成 parquet（依赖 Windows 重算服务），见 [docs/train-pipeline.md](docs/train-pipeline.md)。

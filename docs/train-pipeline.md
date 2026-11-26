@@ -7,7 +7,7 @@
 | 服务 | 地址 | 启动方式 |
 | --- | --- | --- |
 | SandboxFusion 代码执行 | `http://127.0.0.1:8080/run_code` | `deploy/serve_sandbox.sh` |
-| Windows 奖励 / 重算服务 | `http://172.16.6.155:5000` | Windows 交互式计划任务（见 [windows.md](windows.md)） |
+| Windows 奖励 / 重算服务 | `http://<windows-host>:5000` | Windows 交互式计划任务（见 [windows.md](windows.md)） |
 | 数据集 parquet | `data/train_hermes.parquet` | 见 [environment.md](environment.md) |
 
 ## 1. 起服务
@@ -22,7 +22,7 @@ curl -s -X POST http://127.0.0.1:8080/run_code \
      -d '{"code": "print(1+1)", "language": "python"}' | head -c 200
 
 # 验证 Windows 端（必须在跑）
-curl -s http://172.16.6.155:5000/health
+curl -s http://<windows-host>:5000/health
 ```
 
 ## 2. 启动训练

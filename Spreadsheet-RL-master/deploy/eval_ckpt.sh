@@ -2,7 +2,8 @@
 # 用指定权重在指定验证集上做 val-only 评估（不训练、不存档）
 # 用法: bash deploy/eval_ckpt.sh <base|ckpt_dir> <val_parquet> <exp_name> [val_batch]
 set -e
-REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+MODEL_PATH="${MODEL_PATH:-$REPO/models/Qwen3-4B-Thinking-2507}"
 CKPT=${1:?需要 base 或 checkpoint 目录}
 VALF=${2:?需要验证集 parquet}
 EXP=${3:?需要实验名}
@@ -17,7 +18,7 @@ fi
 
 cd "$REPO"
 env CUDA_VISIBLE_DEVICES=4,5,6,7 \
-  MODEL_PATH=/remote-home/yichengfu/models/Qwen3-4B-Thinking-2507 \
+  MODEL_PATH="$MODEL_PATH" \
   TRAIN_BATCH_SIZE=32 PPO_MINI_BATCH=16 N_SAMPLE=8 \
   TOTAL_STEPS=1 SAVE_FREQ=10000 TEST_FREQ=10000 VAL_BEFORE_TRAIN=True VAL_ONLY=True \
   VAL_FILES="$VALF" VAL_BATCH_SIZE="$VAL_BATCH" \

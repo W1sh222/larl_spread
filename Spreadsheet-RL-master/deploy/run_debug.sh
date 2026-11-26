@@ -2,7 +2,7 @@
 # 调试训练（LoRA 版）：验证「修复坏文件 + LoRA 省显存」后训练是否正向/不退化
 # 用法: bash deploy/run_debug.sh   [可选 LORA_RANK=64 TOTAL_STEPS=6 ...]
 set -e
-REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
 export LOG_DIR=${LOG_DIR:-$REPO/logs/debug}
@@ -111,7 +111,7 @@ USE_FUSED_KERNELS="$USE_FUSED_KERNELS" FUSED_BACKEND="$FUSED_BACKEND" bash "$REP
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns="$MAX_ASSISTANT_TURNS" \
     actor_rollout_ref.rollout.multi_turn.max_user_turns="$MAX_ASSISTANT_TURNS" \
     trainer.experiment_name="$EXP_NAME" \
-    trainer.default_local_dir="${CKPT_ROOT:-/remote-home/share/yichengfu/checkpoints}/spreadsheet-rl/$EXP_NAME" \
+    trainer.default_local_dir="${CKPT_ROOT:-$REPO/outputs/checkpoints}/spreadsheet-rl/$EXP_NAME" \
     trainer.rollout_data_dir="$REPO/rollout_data/spreadsheet-rl/$EXP_NAME" \
     trainer.validation_data_dir="$REPO/validation_data/spreadsheet-rl/$EXP_NAME" \
     "${LORA_ARGS[@]}" \
