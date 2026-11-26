@@ -437,6 +437,32 @@ def register(agent_name: str):
     return decorator
 
 
+def _align_reward_extra_keys(outputs: list[DataProto]) -> list[str]:
+    """Align reward extra-info keys across worker batches before ``DataProto.concat``.
+
+    Each worker discovers its key set from its own rows; a reward-manager timeout/error row
+    omits optional keys (e.g. the evaluation workbook fingerprint), so two workers can emit
+    different key sets and ``meta_info["reward_extra_keys"]`` lists. ``DataProto.concat``
+    requires identical keys, so pad the missing ones with ``None`` at the row's own position
+    instead of dropping the field.
+
+    Returns the union key list (first-seen order); empty when no worker reported reward info.
+    """
+    keys: list[str] = list(
+        dict.fromkeys(key for out in outputs for key in out.meta_info.get("reward_extra_keys", []))
+    )
+    if not keys:
+        return keys
+    for out in outputs:
+        for key in keys:
+            if key not in out.non_tensor_batch:
+                pad = np.empty(len(out), dtype=object)
+                pad[:] = None
+                out.non_tensor_batch[key] = pad
+        out.meta_info["reward_extra_keys"] = keys
+    return keys
+
+
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
@@ -966,13 +992,14 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        # Union of keys over all rows (first-seen order): no row is privileged, because a
+        # reward-manager timeout/error row may omit optional keys such as the evaluation
+        # workbook fingerprint while later rows carry them. Missing values become None at
+        # their own position (fail-closed downstream); row i still aligns to sample i.
+        reward_extra_keys = list(dict.fromkeys(key for info in reward_extra_infos for key in info))
         for key in reward_extra_keys:
-            # .get(key): reward_extra_info keys are derived from row 0 only, but an infra-failed
-            # row (reward-manager timeout/error branch) may omit optional keys such as the
-            # evaluation workbook fingerprint. Use .get so a single bad row becomes None at its
-            # own position (fail-closed downstream) instead of raising KeyError and discarding
-            # the whole batch; row i still aligns to sample i.
+            # .get(key): a row missing this key (reward-manager timeout/error branch) becomes
+            # None at its own position instead of raising KeyError and discarding the batch.
             non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
@@ -1210,6 +1237,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        _align_reward_extra_keys(outputs)
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
