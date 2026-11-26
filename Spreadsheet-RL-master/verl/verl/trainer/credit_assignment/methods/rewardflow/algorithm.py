@@ -12,7 +12,7 @@
 
 import logging
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import numpy as np
@@ -26,7 +26,9 @@ from verl.trainer.credit_assignment.methods.rewardflow.state import (
     normalize_state_id,
     normalize_transition,
 )
+from verl.trainer.credit_assignment.normalization import normalize_within_groups
 from verl.trainer.credit_assignment.registry import register_credit_assignment
+from verl.trainer.credit_assignment.state_meta import clamp_response_span
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -34,40 +36,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _UNKNOWN_INITIAL = "<state_unknown>"
 
 
-def _normalize_within_groups(
-    values: np.ndarray,
-    group_keys: list[Any],
-    remove_std: bool,
-    epsilon: float,
-    singleton_as_zero: bool,
-) -> np.ndarray:
-    """组内 mean(/std) 归一化. 行为对齐官方 episode_norm_reward / step_norm_reward:
-    episode: singleton baseline 0 (advantage=raw); step: singleton baseline 自身 (advantage=0)."""
-    out = np.array(values, dtype=np.float64, copy=True)
-    key_to_positions: dict[Any, list[int]] = defaultdict(list)
-    for pos, k in enumerate(group_keys):
-        key_to_positions[k].append(pos)
-
-    for k, positions in key_to_positions.items():
-        arr = values[positions]
-        if len(positions) == 1:
-            mean = float(arr[0]) if singleton_as_zero else 0.0
-            std = 1.0
-        else:
-            mean = float(np.mean(arr))
-            std = float(np.std(arr, ddof=1))
-        for pos in positions:
-            if remove_std:
-                out[pos] = values[pos] - mean
-            else:
-                out[pos] = (values[pos] - mean) / (std + epsilon)
-    return out
-
-
 @register_credit_assignment("rewardflow")
 class RewardFlow(CreditAssignmentMethod):
     name = "rewardflow"
-    requires = frozenset({"step_spans", "step_observations", "step_transitions", "terminal_trusted"})
+    # RewardFlow 不消费 step_observations (仅用 pre/post transition 指纹), 因此不声明它.
+    # "eval_fingerprint" 是 SOFT requirement: success anchor 要求实际提交 bytes 的 canonical
+    # fingerprint 与 terminal fingerprint 一致. rollout 侧据此对每个样本写入 emit 标记,
+    # reward 侧按需计算; adapter 不将其作为 hard-missing 强制 (允许逐行 None -> 仅该
+    # anchor fail-closed 排除, 整体 reward 继续计算).
+    requires = frozenset({"step_spans", "step_transitions", "terminal_trusted", "eval_fingerprint"})
 
     def compute(self, inputs: CreditAssignmentInput, params: dict[str, Any]) -> CreditAssignmentOutput:
         cfg = RewardFlowConfig.from_params(params)
@@ -88,6 +65,23 @@ class RewardFlow(CreditAssignmentMethod):
         traj_rewards = np.asarray(inputs.trajectory_rewards, dtype=np.float64)
         if not np.all(np.isfinite(traj_rewards)):
             raise ValueError("RewardFlow got non-finite trajectory rewards")
+        # raw environment outcome (token_level_scores.sum(-1)): success anchor 与 binary 诊断必须
+        # 用它, 而非 KL 塑形后的训练 reward (use_kl_in_reward=True 时二者不同). 不回退到塑形分.
+        if inputs.raw_trajectory_rewards is None:
+            raise ValueError(
+                "RewardFlow requires raw environment outcomes (raw_trajectory_rewards from "
+                "token_level_scores) to select success anchors, but they are absent. Ensure the "
+                "trainer forwards batch['token_level_scores'] through credit_assignment.compute. "
+                "Silent fallback to KL-shaped rewards is intentionally not allowed."
+            )
+        raw_rewards = np.asarray(inputs.raw_trajectory_rewards, dtype=np.float64)
+        if raw_rewards.shape != traj_rewards.shape:
+            raise ValueError(
+                f"RewardFlow raw_trajectory_rewards shape {raw_rewards.shape} != "
+                f"trajectory_rewards shape {traj_rewards.shape}"
+            )
+        if not np.all(np.isfinite(raw_rewards)):
+            raise ValueError("RewardFlow got non-finite raw trajectory rewards")
         uids = np.asarray(inputs.episode_group_ids, dtype=object)
 
         # --- 行级 metadata 对齐校验 (silent degradation 禁止: 行级缺失 -> raise). ---
@@ -110,10 +104,12 @@ class RewardFlow(CreditAssignmentMethod):
                 )
             transitions.append([normalize_transition(t) for t in raw])
 
-        self._warn_if_not_binary(traj_rewards, cfg)
+        self._warn_if_not_binary(raw_rewards, cfg)
 
         # --- Episode-level advantage (官方 episode_norm_reward: uid 组内 mean_norm). ---
-        episode_adv = _normalize_within_groups(
+        # 训练用 trajectory reward (可能 KL 塑形) 决定 trajectory-level advantage; 与
+        # success anchor 用的 raw outcome 区分 (见下方 anchor 段).
+        episode_adv = normalize_within_groups(
             traj_rewards,
             group_keys=[str(uids[i]) for i in range(bs)],
             remove_std=cfg.remove_std,
@@ -149,20 +145,27 @@ class RewardFlow(CreditAssignmentMethod):
                 if graph.add_edge(tr["pre"], tr["post"]):
                     edges_added += 1
 
-        # Success anchor (论文 Eq.1): 仅当同时满足 (1) 成功 reward (2) terminal fingerprint known
-        # (3) terminal trusted 时, 以 terminal workbook state 为 Phi=1 锚点.
+        # Success anchor (论文 Eq.1): 同时满足 (1) raw 环境 outcome 达 success 阈值
+        # (2) terminal fingerprint known (3) terminal trusted (rollout 侧: 无未证 writeback 且
+        # 实时 state 与交付 artifact 一致) (4) 实际评估 bytes 的 canonical fingerprint 存在且有效
+        # (5) 评估 fingerprint == terminal fingerprint 时, 以 terminal state 为 Phi=1 锚点.
+        # anchor 使用 raw outcome (非 KL 塑形训练分), 保证 use_kl_in_reward 开启时仍正确选锚.
         # graph-valid edge 存在与否 NOT 是锚定前置条件: 无 incoming edge 的孤立 anchor 仍合法,
         # 只是不向其他 state 传播 (归入 connectivity 诊断, 不凭空补馈 potential).
-        # 严禁: 用 last eligible post 替代 anchor / 回退锚到更早中间 state (可能非成功 state) /
-        # 把 excluded transition 恢复为通向 success 的 edge.
-        # known 与 trusted 分离 (rollout 侧判定): fingerprint 存在不代表外部 writeback 已完成.
+        # 严禁: 用 last eligible post 替代 anchor / 回退锚到更早中间 state / 把 excluded transition
+        # 恢复为通向 success 的 edge / 将 eval fingerprint 作为新 graph node 插入.
+        # (4)(5) 是 TOCTOU 防护: 路径/rollout 时点一致 != 被评估 bytes 一致; 缺少评估指纹或与之
+        # 不符 -> 仅排除该 anchor, trajectory advantage 保留, 不回退锚到 rollout state.
         # reward 0 不作 negative anchor (可能为评估基础设施失败).
         terminal_trusted_rows = inputs.extra.get("terminal_trusted")
+        eval_fps = inputs.extra.get("eval_fingerprints")
         anchors = 0
         anchors_missing = 0      # terminal fingerprint unknown (采集失败): 不回退
-        anchors_untrusted = 0    # fingerprint known 但外部 writeback 完成不可证: 不回退
+        anchors_untrusted = 0    # fingerprint known 但 rollout trust 不可证: 不回退
+        anchors_eval_missing = 0    # 评估 bytes fingerprint 缺失/计算失败 (含未启用发射开关)
+        anchors_eval_mismatch = 0   # 评估 fingerprint 与 terminal fingerprint 不一致 (TOCTOU)
         for row in range(bs):
-            if traj_rewards[row] < cfg.success_threshold - cfg.success_tolerance:
+            if raw_rewards[row] < cfg.success_threshold - cfg.success_tolerance:
                 continue
             graph = graphs[row_gkey[row]]
             final = normalize_state_id(finals[row]) if row < len(finals) else None
@@ -174,6 +177,17 @@ class RewardFlow(CreditAssignmentMethod):
             ) else False
             if not trusted:
                 anchors_untrusted += 1
+                continue
+            eval_fp = (
+                normalize_state_id(eval_fps[row])
+                if (eval_fps is not None and row < len(eval_fps))
+                else None
+            )
+            if eval_fp is None:
+                anchors_eval_missing += 1
+                continue
+            if eval_fp != final:
+                anchors_eval_mismatch += 1
                 continue
             if graph.add_success_anchor(final):
                 anchors += 1
@@ -201,7 +215,7 @@ class RewardFlow(CreditAssignmentMethod):
                 flat_norm_keys.append((row_gkey[row], tr["pre"]))  # 论文 Eq.4: 同 pre-state 分组
 
         if flat_rtilde:
-            normalized = _normalize_within_groups(
+            normalized = normalize_within_groups(
                 np.asarray(flat_rtilde, dtype=np.float64),
                 group_keys=flat_norm_keys,
                 remove_std=cfg.remove_std,
@@ -219,9 +233,7 @@ class RewardFlow(CreditAssignmentMethod):
             spans = inputs.step_spans[row] or []
             for k, span in enumerate(spans):
                 total_steps += 1
-                start, end = int(span[0]), int(span[1])
-                start = max(0, start)
-                end = min(response_length, end)
+                start, end = clamp_response_span(span, response_length)
                 if end <= start:
                     continue  # 截断后无有效 span
                 a_act = step_advantage.get((row, k), 0.0)
@@ -238,13 +250,81 @@ class RewardFlow(CreditAssignmentMethod):
                 )
         advantages = advantages * (inputs.assistant_mask > 0).to(advantages.dtype)
 
+        # --- 诊断量 (复用已算的 graph 统计 + 现有 counters; 不重重新计算整个 graph). ---
+        per_graph_stats = [g.stats() for g in graphs.values()]
+        _sum = lambda key: sum(st[key] for st in per_graph_stats)  # noqa: E731
+        node_count = _sum("nodes")
+        edge_count = _sum("edges")
+        self_loop_count = _sum("self_loops")
+        anchors_no_incoming = _sum("anchors_without_valid_incoming_edge")
+        unreachable = _sum("unreachable_valid_states")
+        shared = _sum("shared_in_nodes")
+        group_count = len(graphs)
+
+        # action group 分组统计 (singleton / nonzero) 复用已构建的 flat_.
+        group_sizes = Counter(flat_norm_keys)
+        num_action_groups = len(group_sizes)
+        singleton_groups = sum(1 for sz in group_sizes.values() if sz == 1)
+        num_actions = len(flat_steps)
+        nonzero_action_adv = sum(1 for (row, k) in flat_steps if step_advantage.get((row, k), 0.0) != 0.0)
+        nonzero_traj_adv = int(np.count_nonzero(episode_adv))
+        # raw outcome 中非 binary 的个数 (用 raw environment outcome 而非 KL 塑形分).
+        raw_fractional = int(np.count_nonzero((raw_rewards > 1e-6) & (np.abs(raw_rewards - 1.0) > 1e-6)))
+        # rollout 侧新增诊断标志 (可能缺失 -> 默认 0).
+        artifact_rows = inputs.extra.get("terminal_artifact_consistent")
+        artifact_mismatch = 0
+        if artifact_rows is not None:
+            artifact_mismatch = sum(1 for r in artifact_rows[:bs] if r is not None and not bool(r))
+        wb_rows = inputs.extra.get("unresolved_writeback")
+        unresolved_writeback = 0
+        if wb_rows is not None:
+            unresolved_writeback = sum(1 for r in wb_rows[:bs] if bool(r))
+        # 本 batch 内带有效评估 fingerprint 的 row 数 (判断发射开关是否生效).
+        eval_present = 0
+        if eval_fps is not None:
+            eval_present = sum(1 for r in eval_fps[:bs] if normalize_state_id(r) is not None)
+
+        denom_steps = max(1, total_steps)
+        denom_actions = max(1, num_actions)
+        denom_groups = max(1, num_action_groups)
+        denom_bs = max(1, bs)
+        denom_nodes = max(1, node_count)
+        metrics = {
+            "graph_count": float(group_count),
+            "node_count": float(node_count),
+            "edge_count": float(edge_count),
+            "self_loop_count": float(self_loop_count),
+            "shared_in_nodes": float(shared),
+            "anchor_count": float(anchors),
+            "anchors_missing": float(anchors_missing),
+            "anchors_untrusted": float(anchors_untrusted),
+            "anchors_eval_missing": float(anchors_eval_missing),
+            "anchors_eval_mismatch": float(anchors_eval_mismatch),
+            "anchors_no_incoming": float(anchors_no_incoming),
+            "unknown_state_step_count": float(steps_unknown_state),
+            "graph_valid_action_count": float(steps_graph_eligible),
+            "invalid_action_count": float(steps_invalid),
+            "unreachable_node_frac": float(unreachable) / denom_nodes,
+            "singleton_action_group_frac": float(singleton_groups) / denom_groups,
+            "nonzero_action_adv_frac": float(nonzero_action_adv) / denom_actions,
+            "nonzero_traj_adv_frac": float(nonzero_traj_adv) / denom_bs,
+            "nonzero_token_adv_frac": float(torch.count_nonzero(advantages).item()) / max(1, bs * response_length),
+            "raw_fractional_frac": float(raw_fractional) / denom_bs,
+            "terminal_artifact_mismatch_count": float(artifact_mismatch),
+            "unresolved_writeback_count": float(unresolved_writeback),
+            # 评估指纹发射开关是否生效 (整 batch 都无 eval fingerprint -> 0): 区分
+            # "内容不一致" 与 "根本没回传评估 snapshot". 分母 = bs.
+            "eval_fingerprint_present_frac": float(eval_present) / denom_bs,
+            "zero_action_step_frac": float(zero_action_steps) / denom_steps,
+        }
+
         self._log_summary(
             bs=bs,
-            groups=len(graphs),
-            nodes=sum(g.stats()["nodes"] for g in graphs.values()),
-            edges=sum(g.stats()["edges"] for g in graphs.values()),
-            self_loops=sum(g.stats()["self_loops"] for g in graphs.values()),
-            shared=sum(g.stats()["shared_in_nodes"] for g in graphs.values()),
+            groups=group_count,
+            nodes=node_count,
+            edges=edge_count,
+            self_loops=self_loop_count,
+            shared=shared,
             anchors=anchors,
             anchors_missing=anchors_missing,
             anchors_untrusted=anchors_untrusted,
@@ -252,14 +332,14 @@ class RewardFlow(CreditAssignmentMethod):
             eligible=steps_graph_eligible,
             unknown_state=steps_unknown_state,
             invalid=steps_invalid,
-            anchors_no_incoming=sum(g.stats()["anchors_without_valid_incoming_edge"] for g in graphs.values()),
-            unreachable=sum(g.stats()["unreachable_valid_states"] for g in graphs.values()),
+            anchors_no_incoming=anchors_no_incoming,
+            unreachable=unreachable,
             total_steps=total_steps,
             zero_action_steps=zero_action_steps,
             advantages=advantages,
         )
 
-        return CreditAssignmentOutput(advantages=advantages, returns=advantages)
+        return CreditAssignmentOutput(advantages=advantages, returns=advantages, metrics=metrics)
 
     @staticmethod
     def _warn_if_not_binary(traj_rewards: np.ndarray, cfg: RewardFlowConfig) -> None:

@@ -76,3 +76,25 @@ def normalize_workspace_id(workspace_id: Any) -> Optional[str]:
         return None
 
     return workspace_id
+
+
+def resolve_evaluation_artifact(root: Path, primary_ext: str = ".xlsx") -> Optional[Path]:
+    """Return the workbook actually submitted to the reward evaluator under ``root``.
+
+    Rule (single source of truth, mirrored by the reward evaluator):
+      ``<root>/output<ext>`` if it exists, otherwise ``<root>/data<ext>`` if it exists,
+      otherwise ``None``.
+
+    This is the *evaluation artifact*, which may differ from the *live workbook* the
+    tools manipulate (the seeded ``data.xlsx``). Callers that capture intermediate
+    workbook states must keep using the live path; only terminal-success comparisons
+    and reward evaluation use this artifact selector.
+    """
+    root = Path(root)
+    output_file = root / f"output{primary_ext}"
+    if output_file.is_file():
+        return output_file
+    data_file = root / f"data{primary_ext}"
+    if data_file.is_file():
+        return data_file
+    return None

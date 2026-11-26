@@ -501,6 +501,13 @@ def compute_credit_assignment_advantage(
     # 延迟 import, 避免与 trainer 的循环依赖.
     from verl.trainer.credit_assignment import compute as _credit_assignment_compute
 
+    # raw environment outcome: token_level_scores 总是存在于 batch 且不受 KL-in-reward 塑形.
+    # 通用转发 (不区分 method); 需要它的 method 自行处理 None 情形. 保持 generic: 不在此
+    # 对具体 method 分支.
+    raw_token_level_scores = None
+    if batch is not None and "token_level_scores" in batch:
+        raw_token_level_scores = batch["token_level_scores"]
+
     result = _credit_assignment_compute(
         method=method,
         token_level_rewards=token_level_rewards,
@@ -508,6 +515,7 @@ def compute_credit_assignment_advantage(
         index=index,
         non_tensor_batch=non_tensor_batch,
         params=dict(params),
+        raw_token_level_scores=raw_token_level_scores,
     )
 
     if metrics_out is not None:

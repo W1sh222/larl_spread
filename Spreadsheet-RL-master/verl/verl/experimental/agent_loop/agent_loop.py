@@ -968,7 +968,12 @@ class AgentLoopWorker:
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            # .get(key): reward_extra_info keys are derived from row 0 only, but an infra-failed
+            # row (reward-manager timeout/error branch) may omit optional keys such as the
+            # evaluation workbook fingerprint. Use .get so a single bad row becomes None at its
+            # own position (fail-closed downstream) instead of raising KeyError and discarding
+            # the whole batch; row i still aligns to sample i.
+            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

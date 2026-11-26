@@ -14,47 +14,34 @@ from verl.trainer.credit_assignment.methods.gigpo.grouping import (
     build_step_groups,
 )
 from verl.trainer.credit_assignment.registry import register_credit_assignment
-from verl.trainer.credit_assignment.state_meta import ANCHOR_MODE_STATE, StepMeta, build_step_meta, meta_diagnostics
-
-
-def _normalize_within_groups(
-    values: np.ndarray,
-    group_keys: list[Any],
-    remove_std: bool,
-    epsilon: float,
-    singleton_as_zero: bool,
-) -> np.ndarray:
-    """组内 mean/std 归一化 (对齐原 GiGPO episode_norm/step_norm 行为).
-
-    singleton_as_zero=True: 单元素组的 baseline 取自身 -> advantage 0 (step-level 策略).
-    singleton_as_zero=False: 单元素组 baseline 取 0 -> advantage 保留原值 (episode-level 策略).
-    """
-    out = np.array(values, dtype=np.float64, copy=True)
-    key_to_positions: dict[Any, list[int]] = defaultdict(list)
-    for pos, k in enumerate(group_keys):
-        key_to_positions[k].append(pos)
-
-    for k, positions in key_to_positions.items():
-        arr = values[positions]
-        if len(positions) == 1:
-            mean = float(arr[0]) if singleton_as_zero else 0.0
-            std = 1.0
-        else:
-            mean = float(np.mean(arr))
-            # 与原实现一致: torch.std 为无偏 (sample) std.
-            std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 1.0
-        for pos in positions:
-            if remove_std:
-                out[pos] = values[pos] - mean
-            else:
-                out[pos] = (values[pos] - mean) / (std + epsilon)
-    return out
+from verl.trainer.credit_assignment.normalization import normalize_within_groups
+from verl.trainer.credit_assignment.state_meta import (
+    ANCHOR_MODE_STATE,
+    StepMeta,
+    build_step_meta,
+    clamp_response_span,
+    meta_diagnostics,
+)
 
 
 @register_credit_assignment("gigpo")
 class GiGPO(CreditAssignmentMethod):
     name = "gigpo"
+    # 静态硬需求: step 级 span 与 observation. anchor='state' 时额外需要 structured
+    # transitions (见 required_metadata), 但 observation anchor 基线不需要 -> 不写入静态 requires.
     requires = frozenset({"step_spans", "step_observations"})
+
+    @classmethod
+    def required_metadata(cls, params: dict[str, Any]) -> frozenset:
+        """anchor='state' (默认) 额外依赖 structured transitions; anchor='observation' 不依赖.
+
+        initial_states 仅为 step-0 缺 pre 时的可选 fallback (build_step_meta 容忍 None),
+        因此不强制声明为必需; final_states / terminal_trusted GiGPO 不消费, 不声明.
+        """
+        req = set(cls.requires)
+        if str((params or {}).get("anchor", "state")) == ANCHOR_MODE_STATE:
+            req.add("step_transitions")
+        return frozenset(req)
 
     def compute(self, inputs: CreditAssignmentInput, params: dict[str, Any]) -> CreditAssignmentOutput:
         cfg = GiGPOConfig.from_params(params)
@@ -78,7 +65,7 @@ class GiGPO(CreditAssignmentMethod):
 
         # --- Eq.3: episode-level advantage, 分组单位是 trajectory 而非 step row. ---
         # 组内归一化 -> step 数多的 trajectory 不会获得更大权重.
-        episode_adv = _normalize_within_groups(
+        episode_adv = normalize_within_groups(
             traj_rewards,
             group_keys=[uids[i] for i in range(bs)],
             remove_std=cfg.remove_std,
@@ -157,7 +144,7 @@ class GiGPO(CreditAssignmentMethod):
             group_keys = [group_keys_map[local] for local, p in enumerate(valid)]
             valid_returns = np.array([step_return[p] for p in valid], dtype=np.float64)
             # singleton 组 / 组内 variance 0 -> step advantage 0 (显式策略, 见 grouping 说明).
-            normalized = _normalize_within_groups(
+            normalized = normalize_within_groups(
                 valid_returns,
                 group_keys=group_keys,
                 remove_std=cfg.remove_std,
@@ -172,9 +159,7 @@ class GiGPO(CreditAssignmentMethod):
         for pos in range(num_steps):
             row = step_row[pos]
             span = inputs.step_spans[row][step_idx[pos]]
-            start, end = int(span[0]), int(span[1])
-            start = max(0, start)
-            end = min(response_length, end)
+            start, end = clamp_response_span(span, response_length)
             if end <= start:
                 continue  # 截断后无有效 span
             value = float(episode_adv[row] + cfg.step_advantage_w * step_adv[pos])
