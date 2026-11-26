@@ -16,7 +16,7 @@
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence
 
-from verl.trainer.credit_assignment.methods.gigpo.grouping import (
+from verl.trainer.credit_assignment.anchor_fingerprint import (
     INITIAL_FINGERPRINT,
     INVALID_FINGERPRINT,
     fingerprint_anchor,

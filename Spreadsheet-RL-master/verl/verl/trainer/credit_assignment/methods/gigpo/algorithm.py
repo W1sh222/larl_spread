@@ -7,12 +7,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl.trainer.credit_assignment.anchor_fingerprint import INVALID_FINGERPRINT
 from verl.trainer.credit_assignment.interface import CreditAssignmentInput, CreditAssignmentMethod, CreditAssignmentOutput
 from verl.trainer.credit_assignment.methods.gigpo.config import GiGPOConfig
-from verl.trainer.credit_assignment.methods.gigpo.grouping import (
-    INVALID_FINGERPRINT,
-    build_step_groups,
-)
+from verl.trainer.credit_assignment.methods.gigpo.grouping import build_step_groups
 from verl.trainer.credit_assignment.registry import register_credit_assignment
 from verl.trainer.credit_assignment.normalization import normalize_within_groups
 from verl.trainer.credit_assignment.state_meta import (

@@ -40,7 +40,7 @@ from omegaconf import OmegaConf
 from verl.trainer.credit_assignment import available_methods, compute, run_on_inputs
 from verl.trainer.credit_assignment.interface import INITIAL_STATE_MARKER, CreditAssignmentInput
 from verl.trainer.credit_assignment.methods.gigpo.config import GiGPOConfig
-from verl.trainer.credit_assignment.methods.gigpo.grouping import INVALID_FINGERPRINT
+from verl.trainer.credit_assignment.anchor_fingerprint import INVALID_FINGERPRINT
 from verl.trainer.credit_assignment.state_meta import (
     TRUNC_PARTIAL_ACTION,
     TRUNC_UNEXECUTED,
