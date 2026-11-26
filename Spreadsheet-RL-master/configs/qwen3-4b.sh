@@ -20,8 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR=${PROJECT_DIR:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}
 export RAY_DATA_HOME=${RAY_DATA_HOME:-"${PROJECT_DIR}/verl_data"}
 MODEL_PATH=${MODEL_PATH:-"${SPREADSHEET_RL_MODEL_REPO_ID:-${MODEL_REPO_ID:-Qwen/Qwen3-4B-Thinking-2507}}"}
-# checkpoint 体积大（LoRA 也存全量 base），默认落到仓库内 outputs/，可用 CKPT_ROOT 指向大容量磁盘
-CKPT_ROOT=${CKPT_ROOT:-"${PROJECT_DIR}/outputs/checkpoints"}
+# checkpoint 体积大（LoRA 也存全量 base），统一落到共享盘，避免写满根分区（/ 仅剩约 260G）
+CKPT_ROOT=${CKPT_ROOT:-/remote-home/share/yichengfu/checkpoints}
 CKPTS_DIR=${CKPTS_DIR:-"${CKPT_ROOT}/${project_name}/${exp_name}"}
 SPREADSHEET_RL_DATA_ROOT=${SPREADSHEET_RL_DATA_ROOT:-"${PROJECT_DIR}/data"}
 TRAIN_FILE=${TRAIN_FILE:-"${SPREADSHEET_RL_DATA_ROOT}/train_hermes.parquet"}

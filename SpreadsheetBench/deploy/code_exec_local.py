@@ -9,7 +9,7 @@
 的 /mnt/data 需指向数据集目录（可用软链接实现）。
 
 用法:
-    python code_exec_local.py --port 8081
+    /remote-home/yichengfu/anaconda3/envs/spread/bin/python code_exec_local.py --port 8081
 """
 
 import argparse

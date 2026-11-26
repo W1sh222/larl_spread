@@ -61,7 +61,7 @@ pip install vllm==0.32.0 openai
 
 ## 2. 模型权重
 
-模型权重放在本地目录（不随仓库分发），由 `MODEL_PATH` 指定（各启动脚本自带默认值）：
+放在 `/remote-home/yichengfu/models/` 下（脚本默认路径，可用 `MODEL_PATH` 覆盖）：
 
 | 模型 | 用途 |
 | --- | --- |
@@ -71,7 +71,7 @@ pip install vllm==0.32.0 openai
 ```bash
 # 示例：从 HuggingFace 拉取
 pip install -U "huggingface_hub[cli]"
-hf download Qwen/Qwen3-4B-Thinking-2507 --local-dir "$MODEL_PATH"
+hf download Qwen/Qwen3-4B-Thinking-2507 --local-dir /remote-home/yichengfu/models/Qwen3-4B-Thinking-2507
 ```
 
 ## 3. 数据集
@@ -89,7 +89,7 @@ tar -xzf all_data_912.tar.gz -C all_data_912_v0.1   # 解出 dataset.json + spre
 评测脚本要求代码里能访问 `/mnt/data/`（模型生成的代码硬编码了这个路径），建软链接：
 
 ```bash
-sudo ln -sfn <path-to>/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
+sudo ln -sfn /remote-home/yichengfu/larl/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
 ```
 
 ### 3.2 Spreadsheet-RL（训练用）
@@ -118,11 +118,11 @@ Windows 侧需要**同一份数据**（奖励服务要读 `target.xlsx` 比对�
 
 ```bash
 # Linux
-/path/to/anaconda3/envs/spread/bin/python -c "import torch, vllm, verl; print(torch.__version__, vllm.__version__)"
+/remote-home/yichengfu/anaconda3/envs/spread/bin/python -c "import torch, vllm, verl; print(torch.__version__, vllm.__version__)"
 curl -s http://127.0.0.1:8080/openapi.json | head -c 100          # SandboxFusion
 curl -s http://127.0.0.1:8081/execute -d '{"convid":"t","code":"print(1)"}' -H 'Content-Type: application/json'
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
 
 # Windows（从 Linux）
-ssh <windows-user>@<windows-host> 'curl.exe -s http://127.0.0.1:5000/health'
+ssh fyclab@172.16.6.155 'curl.exe -s http://127.0.0.1:5000/health'
 ```

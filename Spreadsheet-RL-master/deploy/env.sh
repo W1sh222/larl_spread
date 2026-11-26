@@ -1,16 +1,13 @@
 #!/bin/bash
 # Spreadsheet-RL 运行环境变量（source 后使用）
-# 数据集: $REPO/data
-# 奖励/重算服务: Windows 上的 Excel COM 服务（需保持登录状态），地址用环境变量指定
+# 数据集: /remote-home/yichengfu/larl/Spreadsheet-RL-master/data
+# 奖励/重算服务: Windows 172.16.6.155:5000（Excel COM，需保持登录状态）
 
-export REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+export REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
 export SPREADSHEET_RL_DATA_ROOT=${SPREADSHEET_RL_DATA_ROOT:-$REPO/data}
 export SANDBOX_FUSION_URL=${SANDBOX_FUSION_URL:-http://127.0.0.1:8080/run_code}
-export SPREADSHEET_RL_REWARD_URL=${SPREADSHEET_RL_REWARD_URL:-}
-export SPREADSHEET_RL_RECALC_URL=${SPREADSHEET_RL_RECALC_URL:-}
-if [ -z "$SPREADSHEET_RL_REWARD_URL" ] || [ -z "$SPREADSHEET_RL_RECALC_URL" ]; then
-    echo "[env.sh] 警告: SPREADSHEET_RL_REWARD_URL / SPREADSHEET_RL_RECALC_URL 未设置 (Windows 奖励服务地址)" >&2
-fi
+export SPREADSHEET_RL_REWARD_URL=${SPREADSHEET_RL_REWARD_URL:-http://172.16.6.155:5000/reward/submit}
+export SPREADSHEET_RL_RECALC_URL=${SPREADSHEET_RL_RECALC_URL:-http://172.16.6.155:5000/recalculate}
 export SPREADSHEET_RL_REWARD_TIMEOUT_S=${SPREADSHEET_RL_REWARD_TIMEOUT_S:-600}
 export SPREADSHEET_RL_REWARD_MAX_CONCURRENT=${SPREADSHEET_RL_REWARD_MAX_CONCURRENT:-8}
 # 工具侧同时上传的重算请求上限：与服务端 4 个 Excel 实例匹配。
@@ -18,9 +15,9 @@ export SPREADSHEET_RL_REWARD_MAX_CONCURRENT=${SPREADSHEET_RL_REWARD_MAX_CONCURRE
 export SHEET_ARENA_RECALC_MAX_CONCURRENT=${SHEET_ARENA_RECALC_MAX_CONCURRENT:-4}
 export PYTHONPATH="$REPO/verl${PYTHONPATH:+:$PYTHONPATH}"
 
-# 临时目录：放在空间充足的磁盘上（raylet 在 /tmp 超过阈值时会持续告警并拒绝 object spill）
+# 临时目录统一放共享盘：根分区 7T 已用 97%，raylet 在 /tmp 超 95% 时会持续告警并拒绝 object spill
 # 注意路径必须短：ray dashboard 的 AF_UNIX socket 路径上限 107 字节，超长会导致 MetricsHead 启动失败
-export SPREADSHEET_RL_TMP_ROOT=${SPREADSHEET_RL_TMP_ROOT:-/tmp/spreadsheet_rl}
+export SPREADSHEET_RL_TMP_ROOT=${SPREADSHEET_RL_TMP_ROOT:-/remote-home/share/yichengfu/rt}
 export RAY_TMPDIR=${RAY_TMPDIR:-$SPREADSHEET_RL_TMP_ROOT/ray}
 export TMPDIR=${TMPDIR:-$SPREADSHEET_RL_TMP_ROOT/py}
 mkdir -p "$RAY_TMPDIR" "$TMPDIR" 2>/dev/null || true
@@ -35,7 +32,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 
 # fla / 线性注意力 Triton 内核的 JIT 编译缓存持久化（避开 /tmp，重启不丢），
 # 省去每次启动 ~50s 的重编译；所有 ray worker 共享同一份缓存。
-export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$HOME/.triton_cache}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/remote-home/yichengfu/.triton_cache}
 mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
 
 # 本环境 HuggingFace Hub 不可达（DNS 被拦），强制离线避免 transformers 拉取 hub kernel

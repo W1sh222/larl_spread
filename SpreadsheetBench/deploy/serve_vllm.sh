@@ -3,14 +3,14 @@
 # 用法: PORT=8000 GPU=4 bash serve_vllm.sh
 set -e
 
-MODEL=${MODEL:-$HOME/models/Qwen3.5-9B}
+MODEL=${MODEL:-/remote-home/yichengfu/models/Qwen3.5-9B}
 PORT=${PORT:-8000}
 GPU=${GPU:-4}
 TP=${TP:-1}
 SERVED_NAME=${SERVED_NAME:-Qwen3.5-9B}
 MAX_LEN=${MAX_LEN:-32768}
 GMU=${GMU:-0.90}
-CONDA_ROOT=${CONDA_ROOT:-$HOME/anaconda3}
+CONDA_ROOT=${CONDA_ROOT:-/remote-home/yichengfu/anaconda3}
 
 export CUDA_VISIBLE_DEVICES=$GPU
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

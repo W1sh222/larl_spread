@@ -4,8 +4,8 @@
 set -e
 PORT=${PORT:-8080}
 HOST=${HOST:-0.0.0.0}
-CONDA_ROOT=${CONDA_ROOT:-$HOME/anaconda3}
-REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+CONDA_ROOT=${CONDA_ROOT:-/remote-home/yichengfu/anaconda3}
+REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
 
 export SANDBOX_CONFIG=${SANDBOX_CONFIG:-hpc}
 # workspace 请求依赖该数据根；不设则回落到不存在的 /opt/sandboxfusion/data，

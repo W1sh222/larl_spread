@@ -2,12 +2,12 @@
 # 单机 GRPO 训练入口（A100 默认用 sdpa 注意力，config 里默认的 flash_attention_3 只适用于 Hopper）
 # 用法: NGPUS=4 GEN_TP=1 GMU=0.85 bash run_grpo.sh [额外 hydra 覆盖参数]
 set -e
-REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-CONDA_ROOT=${CONDA_ROOT:-$HOME/anaconda3}
+REPO=${REPO:-/remote-home/yichengfu/larl/Spreadsheet-RL-master}
+CONDA_ROOT=${CONDA_ROOT:-/remote-home/yichengfu/anaconda3}
 
 source "$REPO/deploy/env.sh"
 export PATH="$CONDA_ROOT/envs/spread/bin:$PATH"
-export MODEL_PATH=${MODEL_PATH:-$REPO/models/Qwen3.5-9B}
+export MODEL_PATH=${MODEL_PATH:-/remote-home/yichengfu/models/Qwen3.5-9B}
 export WANDB_MODE=${WANDB_MODE:-offline}
 
 NGPUS=${NGPUS:-4}

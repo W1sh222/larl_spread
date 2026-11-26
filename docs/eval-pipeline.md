@@ -12,7 +12,7 @@
 `/mnt/data` 必须指向数据集目录（推理脚本生成的代码里硬编码该路径）：
 
 ```bash
-sudo ln -sfn <path-to>/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
+sudo ln -sfn /remote-home/yichengfu/larl/SpreadsheetBench/data/all_data_912_v0.1 /mnt/data
 ```
 
 ## 1. 起服务
@@ -23,7 +23,8 @@ PORT=8000 GPU=4 bash SpreadsheetBench/deploy/serve_vllm.sh
 # 看到 Uvicorn running on http://0.0.0.0:8000 即可
 
 # 终端 2：本地代码执行（替代需要 Docker 的 code_exec_docker）
-python SpreadsheetBench/deploy/code_exec_local.py --port 8081
+/remote-home/yichengfu/anaconda3/envs/spread/bin/python \
+    SpreadsheetBench/deploy/code_exec_local.py --port 8081
 ```
 
 服务地址自检：
