@@ -97,6 +97,17 @@ def _clamp_span(span: tuple[int, int], response_length: int) -> tuple[int, int]:
     return start, end
 
 
+def clamp_response_span(span: Any, response_length: int) -> tuple[int, int]:
+    """公开工具: 将 [start, end) 解析并夹到响应轴合法范围 (不位移坐标).
+
+    与内部 build_step_meta 使用同一套 [start,end)/clamp 语义; 供各 method 的 token
+    broadcast 循环复用 (GiGPO / RewardFlow), 避免平行实现漂移. 返回的 (start, end)
+    满足 0 <= start <= end <= response_length; end <= start 表示无可见 token (应跳过).
+    malformed span (非两元/不可转 int) 归为 (0, 0) -> 自然跳过.
+    """
+    return _clamp_span(_as_pair(span), response_length)
+
+
 def classify_truncation(span: tuple[int, int], status: str, response_length: int) -> str:
     """区分 "action 被截断" / "tool 未执行" / 正常 (两者可同时发生, 前者优先)."""
     if span[1] > response_length:
