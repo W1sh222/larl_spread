@@ -12,13 +12,29 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
-from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir, normalize_workspace_id
+from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir, normalize_workspace_id, resolve_evaluation_artifact
 
 _DEFAULT_SPREADSHEET_RL_REWARD_TIMEOUT_S = 10800.0  # 3 hours minus buffer
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# RewardFlow 评估 snapshot content 同一性 用: 从"实际提交给外部 evaluator 的同一 bytes"计算
+# canonical workbook fingerprint, 经 generic reward metadata (reward_extra_info -> non_tensor_batch)
+# 透传给 RewardFlow, 与 rollout terminal fingerprint 比对.
+# 开关随样本传递: tool agent loop 依据 credit_assignment method 的需求把 EMIT_FINGERPRINT_KEY
+# 写入 tool_extra_fields, reward manager 合并进 extra_info. 未声明需求的 method (GiGPO/GRPO/GAE)
+# 无此标记 -> 不计算 fingerprint, 返回契约保持 float; 无进程级环境变量, 无配置不一致的失败态.
+EVAL_FINGERPRINT_KEY = "eval_workbook_fingerprint"
+EMIT_FINGERPRINT_KEY = "emit_eval_fingerprint"
+
+
+def _emit_eval_fingerprint(extra_info: Any) -> bool:
+    # 逐样本开关: 由 method 声明经 rollout 侧 tool_extra_fields 合并进 extra_info.
+    if not isinstance(extra_info, dict):
+        return False
+    return bool(extra_info.get(EMIT_FINGERPRINT_KEY, False))
 
 _spreadsheet_rl_reward_semaphore: threading.BoundedSemaphore | None = None
 _spreadsheet_rl_reward_semaphore_initialized = False
@@ -127,10 +143,18 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
           `SPREADSHEET_RL_CLEANUP_WORKSPACE=0`.
     """
 
-    def _result(reward: float, msg: str = "") -> float | Tuple[float, str]:
+    def _result(reward: float, msg: str = "") -> Any:
+        if emit_fp:
+            # dict 结果: reward manager 取 result["score"] 作 reward, 其余 key 落入 reward_extra_info.
+            # 保留 acc 以与旧 scalar 路径的日志语义一致; fingerprint 不可得时为 None (不伪造).
+            return {"score": float(reward), "acc": float(reward), EVAL_FINGERPRINT_KEY: _eval_fp}
         if return_msg:
             return reward, msg
         return reward
+
+    # 仅在样本标记开启且非 return_msg 诊断路径时返回 dict (保护 probe / 旧调用方的 float/tuple 契约).
+    emit_fp = _emit_eval_fingerprint(extra_info) and not return_msg
+    _eval_fp: Optional[str] = None
 
     primary_ext = None
     workspace_id = None
@@ -192,15 +216,12 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
             full_thread_dir = workspace_root
         else:
             full_thread_dir = data_root / thread_dir
-        proc_file = Path(full_thread_dir) / f"output{primary_ext}"
+        # Evaluation-artifact selection lives in a shared env utility so that the
+        # terminal fingerprint consistency check (rollout side) and the bytes graded
+        # here stay in lock-step: output<ext> if present, else data<ext>.
+        payload_file = resolve_evaluation_artifact(Path(full_thread_dir), primary_ext)
 
-        payload_file = proc_file
-        if not payload_file.exists():
-            data_file = Path(full_thread_dir) / f"data{primary_ext}"
-            if data_file.exists():
-                payload_file = data_file
-
-        if not payload_file.exists():
+        if payload_file is None or not payload_file.exists():
             return _result(0.0)
 
         filename = payload_file.name
@@ -211,6 +232,17 @@ def compute_score(ground_truth: Any, extra_info: Any, *, return_msg: bool = Fals
 
         with payload_file.open("rb") as f:
             file_bytes = f.read()
+
+        if emit_fp:
+            # 基于"即将提交的同一 file_bytes"算 canonical fingerprint; 不重新读原始路径
+            # (路径内容可能已变), 不使用 raw zip SHA-256. 失败不阻断 reward 计算.
+            try:
+                from verl.utils.workbook_fingerprint import fingerprint_workbook_bytes
+
+                fp_res = fingerprint_workbook_bytes(file_bytes)
+                _eval_fp = fp_res.get("fingerprint") if fp_res.get("status") == "ok" else None
+            except Exception:  # noqa: BLE001 - fingerprint 计算异常不影响打分
+                _eval_fp = None
 
         if reward_semaphore is not None:
             _t_sem_wait_start = time.monotonic()

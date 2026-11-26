@@ -131,9 +131,10 @@ algorithm:
     params: {}
 
     # Rollout-side step-state transition collection (ca_step_transitions etc.).
-    # null = auto-derive: enabled iff method == "rewardflow", or method == "gigpo" with
-    # params.anchor == "state" (default, because the state anchor needs pre-action fingerprints).
-    # Set true/false to override.
+    # null = auto-derive via the selected method's required_metadata(params): collection is
+    # enabled iff the method declares the structured-state requirement (e.g. RewardFlow always;
+    # GiGPO only when params.anchor == "state"), so no method-name branch lives here. The trainer
+    # resolves this generically. Set true/false to override explicitly.
     collect_step_states: null
 
 # config for the trainer

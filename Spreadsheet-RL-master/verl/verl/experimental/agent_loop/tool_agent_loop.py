@@ -38,7 +38,7 @@ from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.trainer.credit_assignment.interface import INITIAL_STATE_MARKER
-from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir, normalize_workspace_id
+from verl.utils.paths import get_spreadsheet_rl_data_root, normalize_thread_dir, normalize_workspace_id, resolve_evaluation_artifact
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.workbook_fingerprint import fingerprint_workbook_cached
@@ -161,36 +161,58 @@ def _normalize_primary_ext(extra_info: Any) -> str:
     return ".xlsx"
 
 
-def _resolve_collect_step_states(config: Any) -> bool:
-    """structured state transition 采集开关 (RewardFlow / GiGPO state anchor 用).
+def _resolve_collect_step_states(config: Any) -> tuple[bool, bool]:
+    """rollout 侧开关: structured state transition 采集 + eval fingerprint 标记 (generic: 不按具体 method 名分支).
 
-    显式 algorithm.credit_assignment.collect_step_states 优先;
-    未配置时自动启用条件:
-      - method == "rewardflow": 需要 pre/post 状态, 杜绝 "选了 rewardflow 但没采集";
-      - method == "gigpo" 且 params.anchor == "state" (默认): Eq.7 的 anchor 是
-        pre-action full workbook fingerprint, 没有 transitions 时 gigpo 会直接 raise,
-        不允许静默退化成 observation anchor (两种 anchor 分组语义不同).
+    优先级:
+      1. algorithm.adv_estimator != "credit_assignment" 或 credit_assignment 缺失 -> 不采集
+         (确保未启用 CA 时, 其他 estimator 不会因残留配置触发 workbook fingerprint 采集).
+      2. method 存在 -> 总先解析 required_metadata(params) 判断是否需 structured transitions
+         (unknown method 名 -> get_credit_assignment_class 在此初始化阶段即 raise, 不吞).
+      3. 显式 collect_step_states=False 但 method 需 structured -> 立即报配置冲突 (rollout 前
+         fail-fast: 避免先花完 rollout 成本才在 adapter 处发现无 transitions).
+      4. 显式 True -> 采用; null -> 依 method 真实需求自动决定.
+    eval fingerprint 标记由 method 需求自动决定, 随样本 extra_fields 传给 reward 侧
+    (无进程级环境变量 -> 配置即真相, 不存在开关与 method 不一致的失败态).
+    GiGPO observation anchor (不需要 structured) 与 state anchor (需要) 区分保留.
     """
     try:
-        ca = config.get("algorithm", None) if hasattr(config, "get") else None
-        ca = ca.get("credit_assignment", None) if ca is not None else None
+        algo = config.get("algorithm", None) if hasattr(config, "get") else None
     except Exception:
-        return False
+        return False, False
+    if algo is None:
+        return False, False
+    if algo.get("adv_estimator", None) != "credit_assignment":
+        return False, False
+    ca = algo.get("credit_assignment", None)
     if not ca:
-        return False
-    try:
-        explicit = ca.get("collect_step_states", None)
-        if explicit is not None:
-            return bool(explicit)
-        method = ca.get("method", None)
-        if method == "rewardflow":
-            return True
-        if method == "gigpo":
-            params = ca.get("params", None) or {}
-            return str(params.get("anchor", "state")) == "state"
-        return False
-    except Exception:
-        return False
+        return False, False
+    explicit = ca.get("collect_step_states", None)
+    method = ca.get("method", None)
+    needs_structured = False
+    needs_eval_fp = False
+    if method:
+        params = ca.get("params", None) or {}
+        # 延迟 import 避免模块加载期依赖; 子包 import 会触发 methods 注册 (registry 就绪).
+        from verl.trainer.credit_assignment.interface import needs_eval_fingerprint, needs_structured_state
+        from verl.trainer.credit_assignment.registry import get_credit_assignment_class
+
+        cls = get_credit_assignment_class(method)  # unknown method -> raise (不吞)
+        required = frozenset(cls.required_metadata(dict(params)))
+        needs_structured = needs_structured_state(required)
+        needs_eval_fp = needs_eval_fingerprint(required)
+    if explicit is not None:
+        if not bool(explicit) and needs_structured:
+            raise ValueError(
+                "credit_assignment configuration conflict: method '%s' requires structured "
+                "workbook-state transitions (ca_step_transitions), but "
+                "algorithm.credit_assignment.collect_step_states is explicitly false. Set it to "
+                "true (or null for auto) before rollout; otherwise the algorithm would silently "
+                "degrade to no success anchors." % (method,)
+            )
+        return bool(explicit), needs_eval_fp
+    # null -> auto: 依据 method 真实需求 (未选 method 时不采集; adapter 会按实际 needs 校验).
+    return needs_structured, needs_eval_fp
 
 
 def _workspace_primary_file(*, workspace_id: str, thread_dir: str, primary_ext: str) -> Path:
@@ -386,11 +408,17 @@ class AgentData:
         # pre/post 为 "sha256:..." fingerprint 或 None (=unknown, 不得与其他 unknown 合并).
         self._step_transitions: list[dict[str, Any]] = []
         self._workbook_path: Optional[Path] = None
+        self._primary_ext: str = ".xlsx"
         self._cur_state: Optional[str] = None
         self._initial_state: Optional[str] = None
         self._final_state: Optional[str] = None
         self._terminal_reason: Optional[str] = None
-        self._last_executed_tool_names: list[str] = []  # 最后一次执行 tool 的 step 触及的 tool 名
+        # 本次 trajectory 是否曾 dispatch 过 unverified-writeback tool (e.g. code_interpreter).
+        # 单调标志: 一旦置 True 不因后续 read/fingerprint/final-answer/无关 in-process tool 而清除
+        # (成功读到 fingerprint 不能证明外部 writeback 已完成).
+        self._unresolved_writeback: bool = False
+        # 终端 graph state 与实际被评估 artifact 是否一致 (True/False/None=无法判定).
+        self._terminal_artifact_consistent: Optional[bool] = None
         self._state_cache: OrderedDict[tuple, dict] = OrderedDict()
         self._state_stats: dict[str, Any] = {
             "compute": 0,
@@ -429,8 +457,9 @@ class ToolAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
 
-        # RewardFlow 等 structured-state method 的采集开关 (默认关, GiGPO/GRPO 零开销).
-        self.collect_step_states = _resolve_collect_step_states(self.config)
+        # RewardFlow 等 structured-state method 的采集开关 (默认关, GiGPO/GRPO 零开销);
+        # emit_eval_fingerprint 由 method 需求决定, 经 extra_fields 逐样本传给 reward 侧.
+        self.collect_step_states, self.emit_eval_fingerprint = _resolve_collect_step_states(self.config)
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -499,6 +528,7 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data._workbook_path = _workspace_primary_file(
                         workspace_id=request_id, thread_dir=thread_dir, primary_ext=primary_ext
                     )
+                    agent_data._primary_ext = primary_ext
                     state, reason = await self._fingerprint_state(agent_data)
                     agent_data._cur_state = state
                     agent_data._initial_state = state
@@ -555,23 +585,37 @@ class ToolAgentLoop(AgentLoopBase):
                 "ca_step_observations": list(agent_data._step_observations),
             }
         )
+        if self.emit_eval_fingerprint:
+            # reward 侧逐样本开关: 随 tool_extra_fields 合并进 reward 的 extra_info, sheet_arena
+            # 据此计算并回传 canonical eval fingerprint. 未声明需求的 method 不写入 -> 零开销.
+            output.extra_fields["emit_eval_fingerprint"] = True
         if self.collect_step_states:
-            # 兜底采一次 final state (最后一 batch 采集失败时仍可能补上磁盘现状).
+            # terminal final state 只认本次 terminal fingerprint 采集结果; 采集失败 -> None (unknown).
+            # 不回退到先前观测 state (_cur_state): 旧 state 可能是中间状态, 把 success anchor 错绑其上.
+            # _cur_state 仍作为 last-known live state 保留 (GiGPO step-0 initial fallback / 诊断用),
+            # 但绝不用于 RewardFlow terminal success anchor (unknown terminal -> 不锚定).
             final_state, _ = await self._fingerprint_state(agent_data)
-            agent_data._final_state = final_state if final_state is not None else agent_data._cur_state
+            agent_data._final_state = final_state
             if agent_data._terminal_reason is None:
                 agent_data._terminal_reason = "natural"
-            # Terminal state trust (与 transition graph validity 分离判定):
+            # 终端 graph state 与实际被评估 artifact (output.xlsx 优先, 否则 data.xlsx) 一致性.
+            agent_data._terminal_artifact_consistent = await self._resolve_terminal_artifact_consistency(agent_data)
+            # Terminal state trust (与 transition graph validity 分离判定; rollout 侧必要非充分条件):
             #   known   = terminal fingerprint 采集成功 (非 None);
-            #   trusted = known 且最后一次执行 tool 的 step 未触达 unverified-writeback tool.
-            # in-process / recalc 写入同步且已验证, 故其后的本地重读即 reward 评估对象;
-            # 若最后修改来自 code_interpreter (远程 writeback 时序不可证), 则不假定 fingerprint
-            # 存在即代表 writeback 完成 -> untrusted (不回退到更早 state, 也不声称已保证).
+            #   trusted = known 且本 trajectory 无未解决 external writeback 且终端 live state 与
+            #             交付评分 artifact 为同一文件/同指纹 (fail-closed: 不一致/无法判定 -> 不建
+            #             anchor, trajectory-level advantage 仍保留).
+            # 注意: 这里只是 rollout 结束时点的 path/capture 一致性, 不表示实际被评估 bytes 与
+            # terminal fingerprint 内容一致 (同一路径 != 同一内容). 评估 bytes 的内容同一性由
+            # RewardFlow 侧将 sheet_arena 回传的 eval_workbook_fingerprint 与 ca_final_state 严格
+            # 比对单独保证 (TOCTOU 防护); 二者缺一均不锁定 success anchor.
+            # in-process / recalc 写入同步且已验证; code_interpreter 远程 writeback 时序不可证.
             terminal_known = agent_data._final_state is not None
-            touched_unverified_terminal = any(
-                name in _UNVERIFIED_WRITEBACK_TOOLS for name in agent_data._last_executed_tool_names
+            terminal_trusted = (
+                terminal_known
+                and not agent_data._unresolved_writeback
+                and agent_data._terminal_artifact_consistent is True
             )
-            terminal_trusted = terminal_known and not touched_unverified_terminal
             output.extra_fields.update(
                 {
                     "ca_step_transitions": [dict(t) for t in agent_data._step_transitions],
@@ -579,6 +623,8 @@ class ToolAgentLoop(AgentLoopBase):
                     "ca_final_state": agent_data._final_state,
                     "ca_terminal_trusted": terminal_trusted,
                     "ca_terminal_reason": agent_data._terminal_reason,
+                    "ca_terminal_artifact_consistent": agent_data._terminal_artifact_consistent,
+                    "ca_unresolved_writeback": agent_data._unresolved_writeback,
                     "ca_state_stats": dict(agent_data._state_stats),
                 }
             )
@@ -693,6 +739,15 @@ class ToolAgentLoop(AgentLoopBase):
         )
         tool_call_names = [tool_call.name for tool_call in agent_data.tool_calls]
 
+        # 记录 dispatch 过的 unverified-writeback tool: 必须在实际执行之前置位, 使 tool execution
+        # 抛异常时 uncertainty 仍被保留 (fail-safe, 不再依赖 _execute_tool_calls 正常返回).
+        # 判据是实际 dispatch 集 tool_calls (parse 失败 / overflow 未 dispatch 的 call 不在其中),
+        # 与 fingerprint 采集成败无关 (§4.2). 单调: 一旦置位不因后续 read/fingerprint/final-answer/
+        # 无关 in-process tool 而清除 (§4.3).
+        if self.collect_step_states and any(
+            tc.name in _UNVERIFIED_WRITEBACK_TOOLS for tc in tool_calls
+        ):
+            agent_data._unresolved_writeback = True
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await self._execute_tool_calls(tool_calls, agent_data.tools_kwargs, agent_data)
         if serial_overflow_tool_calls:
@@ -834,12 +889,12 @@ class ToolAgentLoop(AgentLoopBase):
 
     # ---- structured workbook-state collection (算法中立 metadata) ----
 
-    def _fingerprint_sync(self, agent_data: AgentData) -> tuple[Optional[str], Optional[str]]:
-        path = agent_data._workbook_path
-        if path is None:
+    def _fingerprint_sync(self, agent_data: AgentData, path: Optional[Path] = None) -> tuple[Optional[str], Optional[str]]:
+        target = path if path is not None else agent_data._workbook_path
+        if target is None:
             return None, "no_workspace_file"
         try:
-            result = fingerprint_workbook_cached(str(path), agent_data._state_cache)
+            result = fingerprint_workbook_cached(str(target), agent_data._state_cache)
         except Exception as exc:
             return None, f"fingerprint_error:{type(exc).__name__}"
         stats = agent_data._state_stats
@@ -853,9 +908,40 @@ class ToolAgentLoop(AgentLoopBase):
         stats["unknown"] += 1
         return None, str(result.get("reason", "unknown"))
 
-    async def _fingerprint_state(self, agent_data: AgentData) -> tuple[Optional[str], Optional[str]]:
+    async def _fingerprint_state(self, agent_data: AgentData, path: Optional[Path] = None) -> tuple[Optional[str], Optional[str]]:
         # 避免长时间 block event loop.
-        return await asyncio.to_thread(self._fingerprint_sync, agent_data)
+        return await asyncio.to_thread(self._fingerprint_sync, agent_data, path)
+
+    async def _resolve_terminal_artifact_consistency(self, agent_data: AgentData) -> Optional[bool]:
+        """终端 graph state (live workbook fingerprint) 与交付评分 artifact 在 rollout 时点是否一致.
+
+        - 无 live path 或 artifact 不存在 -> None (无法判定; caller 保守 fail-closed).
+        - artifact 与 live workbook 同一文件 (常见: 无 output.xlsx, artifact=data.xlsx) -> True.
+        - 否则 fingerprint artifact 与 final live state 比较: 相同 -> True, 不同 -> False.
+        注意: same_file 仅代表路径/同一文件对象, 不等于被评估 snapshot 的内容指纹 (路径相同
+        不等于内容相同). 这是 capture-time 必要非充分一致性; terminal 采集后、reward 读取
+        bytes 之间若文件被外部修改的 TOCTOU 不由本检查保证, 而是由 RewardFlow 侧将 sheet_arena
+        回传的评估 bytes canonical fingerprint 与 ca_final_state 严格比对单独保证 (见 README).
+        """
+        live = agent_data._workbook_path
+        if live is None:
+            return None
+        try:
+            artifact = resolve_evaluation_artifact(Path(live).parent, agent_data._primary_ext)
+        except Exception:
+            return None
+        if artifact is None:
+            return None
+        try:
+            same_file = Path(artifact).resolve() == Path(live).resolve()
+        except Exception:
+            same_file = Path(artifact) == Path(live)
+        if same_file:
+            return True
+        artifact_fp, _ = await self._fingerprint_state(agent_data, artifact)
+        if artifact_fp is None or agent_data._final_state is None:
+            return None
+        return artifact_fp == agent_data._final_state
 
     def _close_transition_unexecuted(self, agent_data: AgentData, *, reason: str) -> None:
         """assistant decision 产生但未执行 tool (提前终止): 不构成 graph edge."""
@@ -906,13 +992,16 @@ class ToolAgentLoop(AgentLoopBase):
             tr["reason"] = "pre_state_unknown"
             agent_data._cur_state = post
             return
-        # sandbox 远程 writeback 完成时序无代码级保证: 若本 step 含此类 tool,
-        # post-state 可能漏写 -> 保守排除出 graph (仅计 episode advantage).
-        agent_data._last_executed_tool_names = [str(name) for name in tool_names]
-        touched_unsafe = any(name in _UNVERIFIED_WRITEBACK_TOOLS for name in tool_names)
-        tr["graph_valid"] = not touched_unsafe
-        if touched_unsafe:
+        # sandbox 远程 writeback 完成时序无代码级保证: _unresolved_writeback 是 trajectory 单调
+        # 标志 (首个 unverified-writeback dispatch 之前为 False, 之后恒 True). 一旦置位, 该点
+        # 之后所有 transition 的 pre/post content 均可能被迟写污染 -> 无依据视为 graph-valid edge,
+        # 全部保守排除出 graph (仅计 trajectory advantage; terminal anchor 另由 terminal_trusted 拦).
+        # 关键: unsafe 之前已提交的 transition (处理时 flag 仍 False) 完整保留, 不是一刀切删除.
+        if agent_data._unresolved_writeback:
+            tr["graph_valid"] = False
             tr["reason"] = "external_writeback_unverified"
+        else:
+            tr["graph_valid"] = True
         agent_data._cur_state = post
 
     async def _execute_tool_calls(

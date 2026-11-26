@@ -99,35 +99,20 @@ def _unknown(reason: str) -> dict[str, Any]:
     return {"status": STATUS_UNKNOWN, "reason": str(reason), "fingerprint": None}
 
 
-def fingerprint_workbook(
-    path: str,
+def _canonicalize_workbook(
+    wb: Any,
+    reload_workbook: Any,
     *,
-    max_file_mb: float = DEFAULT_MAX_FILE_MB,
-    max_cells: int = DEFAULT_MAX_CELLS,
-    max_dims: int = DEFAULT_MAX_DIMS,
+    max_cells: int,
+    max_dims: int,
+    t0: float,
 ) -> dict[str, Any]:
-    """返回 {"status": ok/unknown, "fingerprint": "sha256:<hex>"|None, "reason", "cells", "parse_ms"}."""
-    p = Path(path)
-    try:
-        st = os.stat(p)
-    except OSError:
-        return _unknown("missing_file")
-    if not os.path.isfile(p):
-        return _unknown("not_a_file")
-    if st.st_size > max_file_mb * 1024 * 1024:
-        return _unknown("file_too_large")
+    """已加载 workbook -> canonical content repr -> sha256.
 
-    try:
-        import openpyxl
-    except ImportError:
-        return _unknown("openpyxl_unavailable")
-
-    t0 = time.perf_counter()
-    try:
-        wb = openpyxl.load_workbook(filename=str(p), data_only=False, keep_links=False)
-    except Exception as exc:  # 损坏文件 / 不支持的 feature
-        return _unknown(f"parse_error:{type(exc).__name__}")
-
+    rollout 侧 (从路径加载) 与评估侧 (从提交的 bytes 加载) 共用本函数, 以保证
+    canonicalization 规则完全一致: 同一内容 -> 同一 fingerprint.
+    reload_workbook(data_only: bool) 用于重新打开同一来源以读 formula cache 值.
+    """
     try:
         lines: list[str] = []
         cell_lines: list[tuple[int, int, int, str]] = []  # (sheet_idx, row, col, record)
@@ -221,7 +206,7 @@ def fingerprint_workbook(
         # 公式相同但 cache 不同 都视为不同 state; 无法读取的 cache 记 <no_cache>, 不臆造).
         if formula_coords:
             try:
-                wb_cache = openpyxl.load_workbook(filename=str(p), data_only=True, keep_links=False)
+                wb_cache = reload_workbook(True)
                 for si, coord in sorted(formula_coords):
                     try:
                         cv = wb_cache.worksheets[si][coord].value
@@ -242,6 +227,91 @@ def fingerprint_workbook(
         }
     except Exception as exc:  # 防御: 任何意外都归为 unknown, 不得污染 graph
         return _unknown(f"unexpected:{type(exc).__name__}")
+
+
+def fingerprint_workbook(
+    path: str,
+    *,
+    max_file_mb: float = DEFAULT_MAX_FILE_MB,
+    max_cells: int = DEFAULT_MAX_CELLS,
+    max_dims: int = DEFAULT_MAX_DIMS,
+) -> dict[str, Any]:
+    """返回 {"status": ok/unknown, "fingerprint": "sha256:<hex>"|None, "reason", "cells", "parse_ms"}."""
+    p = Path(path)
+    try:
+        st = os.stat(p)
+    except OSError:
+        return _unknown("missing_file")
+    if not os.path.isfile(p):
+        return _unknown("not_a_file")
+    if st.st_size > max_file_mb * 1024 * 1024:
+        return _unknown("file_too_large")
+
+    try:
+        import openpyxl
+    except ImportError:
+        return _unknown("openpyxl_unavailable")
+
+    def reload(data_only: bool):
+        return openpyxl.load_workbook(filename=str(p), data_only=data_only, keep_links=False)
+
+    t0 = time.perf_counter()
+    try:
+        wb = reload(False)
+    except Exception as exc:  # 损坏文件 / 不支持的 feature
+        return _unknown(f"parse_error:{type(exc).__name__}")
+
+    try:
+        return _canonicalize_workbook(wb, reload, max_cells=max_cells, max_dims=max_dims, t0=t0)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def fingerprint_workbook_bytes(
+    data: bytes,
+    *,
+    max_file_mb: float = DEFAULT_MAX_FILE_MB,
+    max_cells: int = DEFAULT_MAX_CELLS,
+    max_dims: int = DEFAULT_MAX_DIMS,
+) -> dict[str, Any]:
+    """从内存中的 workbook bytes 计算 canonical fingerprint (评估侧用).
+
+    与 fingerprint_workbook(path) 共用 _canonicalize_workbook -> 同一内容同一指纹.
+    不重新打开原始路径; 不直接 hash raw zip bytes (zip metadata 非决定论).
+    计算失败/超限 -> status=unknown, fingerprint=None (不伪造成正常指纹).
+    """
+    if data is None:
+        return _unknown("no_bytes")
+    try:
+        n = len(data)
+    except TypeError:
+        return _unknown("invalid_bytes")
+    if n <= 0:
+        return _unknown("empty_bytes")
+    if n > max_file_mb * 1024 * 1024:
+        return _unknown("file_too_large")
+
+    try:
+        import io
+
+        import openpyxl
+    except ImportError:
+        return _unknown("openpyxl_unavailable")
+
+    def reload(data_only: bool):
+        return openpyxl.load_workbook(io.BytesIO(data), data_only=data_only, keep_links=False)
+
+    t0 = time.perf_counter()
+    try:
+        wb = reload(False)
+    except Exception as exc:
+        return _unknown(f"parse_error:{type(exc).__name__}")
+
+    try:
+        return _canonicalize_workbook(wb, reload, max_cells=max_cells, max_dims=max_dims, t0=t0)
     finally:
         try:
             wb.close()

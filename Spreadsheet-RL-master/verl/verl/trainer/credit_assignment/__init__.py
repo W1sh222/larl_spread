@@ -17,6 +17,7 @@ from verl.trainer.credit_assignment.interface import (
     CreditAssignmentInput,
     CreditAssignmentMethod,
     CreditAssignmentOutput,
+    needs_structured_state,
 )
 from verl.trainer.credit_assignment.registry import (
     available_methods,
@@ -32,6 +33,7 @@ __all__ = [
     "available_methods",
     "compute",
     "get_credit_assignment_class",
+    "needs_structured_state",
     "register_credit_assignment",
     "run_on_inputs",
 ]
@@ -44,8 +46,13 @@ def compute(
     index,
     non_tensor_batch: dict,
     params: dict[str, Any] | None = None,
+    raw_token_level_scores=None,
 ) -> CreditAssignmentOutput:
-    """从 verl 张量/元数据直接计算 advantage (推荐入口)."""
+    """从 verl 张量/元数据直接计算 advantage (推荐入口).
+
+    raw_token_level_scores: 可选的未塑形环境分 (token_level_scores), 供需要区分
+    raw outcome 与训练 reward 的 method (如 RewardFlow) 选 anchor. 缺失时由 method 自行报错.
+    """
     return _adapter_compute(
         method=method,
         token_level_rewards=token_level_rewards,
@@ -53,4 +60,5 @@ def compute(
         index=index,
         non_tensor_batch=non_tensor_batch,
         params=params or {},
+        raw_token_level_scores=raw_token_level_scores,
     )
