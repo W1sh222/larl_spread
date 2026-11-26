@@ -1039,6 +1039,34 @@ class SqliteJobStore:
             conn.commit()
             return int(cur.rowcount)
 
+    def mark_stale_queued_as_error(self, *, older_than_s: float, msg: str) -> int:
+        """把长期排队但从未被领取的任务判为失败。
+
+        服务端 Excel 池卡死时队列会堆积上千条陈旧任务；重启后它们会排在新任务
+        前面被逐个消费，导致新一轮评测长时间拿不到分数。启动时清理这些陈旧任务。
+        """
+        with self._connection() as conn:
+            now = time.time()
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, reward = 0.0, msg = ?, finished_at_s = ?, updated_at_s = ?
+                WHERE status = ?
+                  AND started_at_s IS NULL
+                  AND created_at_s < ?;
+                """,
+                (
+                    JobStatus.ERROR.value,
+                    msg or "stale queued job",
+                    now,
+                    now,
+                    JobStatus.QUEUED.value,
+                    now - float(older_than_s),
+                ),
+            )
+            conn.commit()
+            return int(cur.rowcount)
+
     def _list_finished_before(
         self,
         conn: sqlite3.Connection,

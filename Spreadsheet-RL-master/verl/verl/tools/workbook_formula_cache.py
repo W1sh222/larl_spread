@@ -13,6 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import io
+import os
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -168,3 +171,51 @@ def _restore_formula_cached_values_in_xlsx(
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
         raise RuntimeError(f"failed to preserve formula cached values: {exc}") from None
+
+
+def save_workbook_atomically(workbook, path: Path) -> None:
+    """Serialize ``workbook`` to memory and swap it in atomically.
+
+    ``openpyxl.Workbook.save`` truncates the destination before writing the zip,
+    so any exception raised mid-serialization leaves a corrupt workbook behind.
+    Writing to a sibling temp file first guarantees the previous file stays
+    readable if the save fails.
+    """
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    content = buffer.getvalue()
+    path = Path(path)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=path.suffix,
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass

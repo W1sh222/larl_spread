@@ -19,6 +19,13 @@ ATTN_IMPL=${ATTN_IMPL:-sdpa}
 MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-8192}
 MAX_RESP_LEN=${MAX_RESP_LEN:-16384}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-24576}
+# 训练侧（actor 反传 / ref 与 rollout 的 log_prob 重算）每个 micro-batch 的 token 上限。
+# lm_head logits = seq_len × vocab(248320) × 2B，长序列下单次分配可达 12+ GiB，
+# 是 update_actor 末期 OOM 的主因。把训练 token 预算降到 MAX_MODEL_LEN 以下，
+# 让反传按更小的 token 块切分（数学等价，仅多几个 micro-batch），峰值显存随 token 数线性下降。
+# rollout 生成长度仍由 MAX_MODEL_LEN 决定，不受影响。默认对齐 MAX_MODEL_LEN，可被环境变量覆盖。
+ACTOR_MAX_TOKEN_LEN=${ACTOR_MAX_TOKEN_LEN:-$MAX_MODEL_LEN}
+LOGPROB_MAX_TOKEN_LEN=${LOGPROB_MAX_TOKEN_LEN:-$MAX_MODEL_LEN}
 # Qwen3.5 默认会输出思考过程，会吃掉大段 response 预算，默认关闭（与已验证的 9B 配置一致）
 ENABLE_THINKING=${ENABLE_THINKING:-False}
 # 9B 的 embed_tokens 张量约 2.03GB（248320×4096 bf16），超过默认 1024MB 传输桶会导致
@@ -28,6 +35,16 @@ BUCKET_MB=${BUCKET_MB:-4096}
 # sample_tokens 阶段无响应，EngineCore 报 RPC 超时后引擎死亡，整卡进入错误态。
 # 默认用 eager 模式（关闭 cuda graph），吞吐略降但稳定。
 ENFORCE_EAGER=${ENFORCE_EAGER:-True}
+# 是否去除 padding 走变长注意力（省激活显存）。默认 False（与已验证的 A100 sdpa 路径一致）；
+# 设 REMOVE_PADDING=True 开启，需验证与 sdpa/无 flash_attn 的兼容性。
+REMOVE_PADDING=${REMOVE_PADDING:-False}
+# 是否用 fused linear-cross-entropy（不物化全量 lm_head logits，峰值省 10+ GiB）。
+# 上推上下文（max_resp≥20k）后单 micro-batch logits 可达 13-16GiB，是 update_actor OOM 主因，
+# 开启 fused 后 logits 按 512-token 分块计算，峰值降到 ~0.5GiB。默认 False（保守）；
+# 设 USE_FUSED_KERNELS=True 开启。注意：triton backend 在 remove_padding 路径下返回
+# 非连续 log_probs，反传会触发 is_contiguous 断言 → 必须配 FUSED_BACKEND=torch。
+USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-False}
+FUSED_BACKEND=${FUSED_BACKEND:-triton}
 
 cd "$REPO"
 bash configs/qwen3-4b.sh "$@" \
@@ -36,14 +53,15 @@ bash configs/qwen3-4b.sh "$@" \
     data.max_response_length="$MAX_RESP_LEN" \
     actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
     actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_MODEL_LEN" \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$MAX_MODEL_LEN" \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$MAX_MODEL_LEN" \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$MAX_MODEL_LEN" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$ACTOR_MAX_TOKEN_LEN" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
     actor_rollout_ref.model.override_config.attn_implementation="$ATTN_IMPL" \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes="$BUCKET_MB" \
     actor_rollout_ref.rollout.enforce_eager="$ENFORCE_EAGER" \
-    actor_rollout_ref.model.use_remove_padding=False \
-    actor_rollout_ref.model.use_fused_kernels=False \
+    actor_rollout_ref.model.use_remove_padding="${REMOVE_PADDING:-False}" \
+    actor_rollout_ref.model.use_fused_kernels="$USE_FUSED_KERNELS" \
+    actor_rollout_ref.model.fused_kernel_options.impl_backend="$FUSED_BACKEND" \
     trainer.n_gpus_per_node="$NGPUS" \
     actor_rollout_ref.actor.fsdp_config.fsdp_size="$NGPUS" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="$GEN_TP" \

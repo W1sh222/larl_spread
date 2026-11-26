@@ -39,6 +39,7 @@ from .schemas import OpenAIFunctionToolSchema, ToolResponse
 from .workbook_formula_cache import (
     _collect_formula_cached_values_from_xlsx,
     _restore_formula_cached_values_in_xlsx,
+    save_workbook_atomically,
 )
 from .worksheet_resolution import WorksheetResolutionError, resolve_worksheet
 
@@ -339,7 +340,7 @@ def _mutate_workbook_sync(
                 f"action received {_snippet(action)}; pass one of create, rename, delete, copy, move, hide, unhide.",
             )
 
-        wb.save(str(file_path))
+        save_workbook_atomically(wb, file_path)
         formula_cache_preserved = True
         try:
             _restore_formula_cached_values_in_xlsx(file_path, cached_formula_values, title_map=title_map)

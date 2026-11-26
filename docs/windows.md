@@ -90,7 +90,20 @@ curl -s http://172.16.6.155:5000/health
 | POST | `/recalculate` | 同步重算（工具链内部使用） |
 | POST | `/recalculate/submit` + `/recalculate/status/{job_id}` | 异步重算 |
 
-并发：`--workers 2 --instance-per-worker 2` = 4 个常驻 Excel 实例。OOM 时降 `--workers` 或设 `REWARD_API_MAX_RUNNING_JOBS`。
+并发：`--workers 1 --instance-per-worker 4` = 1 个 API 进程 + 4 个常驻 Excel 实例。不要用多个 uvicorn worker：每个 worker 会各自管一套 Excel 池，回收/重启逻辑互相竞争。
+
+高并发保护（均在 `win_start_reward_api.ps1` 里设置）：
+
+| 变量 | 值 | 作用 |
+| --- | --- | --- |
+| `REWARD_API_MAX_QUEUE_SIZE` | 256 | 待办队列上限，超出立即返回 `busy` |
+| `REWARD_API_MAX_INFLIGHT_UPLOADS` | 8 | 同时处理的上传数上限；在读取请求体之前拒绝，避免 Starlette 把整个工作簿 spool 到磁盘 |
+| `TEMP` / `TMP` | `E:\SpreadsheetRL\tmp` | 上传 spool 与 Excel 临时文件改放数据盘，避免写满 C: |
+| `REWARD_API_WINDOWS_EXCEL_RECYCLE_JOBS` | 50 | 每 50 个任务回收一次 Excel，限制内存增长 |
+| `REWARD_API_WINDOWS_EXCEL_RECYCLE_PRIVATE_MB` | 3072 | Excel 私有内存超过 3GB 时回收 |
+| `REWARD_API_WORKER_TIMEOUT_S` | 240 | 单个任务算不完就杀掉 Excel 重建，防止卡死的 Excel 长期占坑 |
+
+另外建议在 Windows Defender 里给 `E:\SpreadsheetRL` 和 `E:\SpreadsheetRL\tmp` 加排除项：上千个 xlsx 的实时扫描会把 CPU 打满。
 
 ## 5. SBT-Recalc（评测 GT 批量重算）
 

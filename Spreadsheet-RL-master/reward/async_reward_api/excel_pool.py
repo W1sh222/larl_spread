@@ -17,8 +17,11 @@ from pathlib import Path
 from .aio import _run_cancellation_safe
 from .messages import format_exception as _format_exception
 from .messages import public_worker_message as _public_worker_message
+from .platform import Platform
 from .windows_process import (
     _creationflags_no_window,
+    _kill_excel_pid,
+    _list_orphan_excel_pids,
     _process_creation_time_with_fallback,
     _process_exists,
     _process_matches_creation_time,
@@ -63,23 +66,34 @@ def _write_worker_stdin(stdin, text: str) -> None:
 def _get_windows_excel_recycle_private_mb() -> int:
     value = os.environ.get("REWARD_API_WINDOWS_EXCEL_RECYCLE_PRIVATE_MB")
     if value is None or not value.strip():
-        return 4096
+        return 3072
     try:
         n = int(value)
         return max(0, n)
     except ValueError:
-        return 4096
+        return 3072
+
+
+def _get_excel_reap_on_start() -> bool:
+    """池启动前是否清理残留的 EXCEL.EXE。
+
+    单 worker 部署（默认 --workers 1）下残留 Excel 一定属于已死进程，直接清理可
+    避免 Excel COM 被占用导致 replacement.start() 永久失败。
+    多 worker 部署请设 REWARD_API_EXCEL_REAP_ON_START=0，否则会互相杀掉对方的 Excel。
+    """
+    value = os.environ.get("REWARD_API_EXCEL_REAP_ON_START", "1")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _get_windows_excel_recycle_jobs() -> int:
     value = os.environ.get("REWARD_API_WINDOWS_EXCEL_RECYCLE_JOBS")
     if value is None or not value.strip():
-        return 0
+        return 50
     try:
         n = int(value)
         return max(0, n)
     except ValueError:
-        return 0
+        return 50
 
 
 def _coerce_ready_pid(value: object) -> int | None:
@@ -643,6 +657,12 @@ class ExcelWorkerPool:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
+        if _get_excel_reap_on_start():
+            try:
+                # 此刻本池尚无 worker，任何存活 EXCEL.EXE 都是上个进程遗留的孤儿。
+                await self._reap_orphan_excel(reason="pool start")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[excel_pool] orphan Excel reap on start failed: {_format_exception(exc)}")
         candidates = [
             ExcelWorkerProcess(
                 platform=self._platform,
@@ -797,6 +817,34 @@ class ExcelWorkerPool:
         task = asyncio.create_task(self._recycle_slot(idx, expected=expected, reason=reason))
         self._recycle_tasks[idx] = task
 
+    async def _reap_orphan_excel(self, *, reason: str) -> int:
+        """清理父进程已退出的孤儿 EXCEL.EXE 进程。
+
+        卡死的 Excel 会占住 COM 通道，使 replacement.start() 永远失败
+        （表现为 restart_pending 长期不归零、queued 只增不减）。只清理父进程已死的
+        实例，因此多 worker 部署下不会误伤其它 worker 的正常 Excel。
+        """
+        platform = Platform(self._platform)
+        if platform is not Platform.WINDOWS:
+            return 0
+        orphans = await asyncio.to_thread(_list_orphan_excel_pids, platform)
+        if not orphans:
+            return 0
+        killed = 0
+        for pid in sorted(orphans):
+            creation_time = await asyncio.to_thread(_process_creation_time_with_fallback, pid)
+            ok = await asyncio.to_thread(
+                _kill_excel_pid,
+                platform=platform,
+                pid=pid,
+                expected_creation_time=creation_time,
+            )
+            if ok:
+                killed += 1
+        if killed:
+            logger.warning(f"[excel_pool] reaped {killed} orphan EXCEL.EXE process(es): {reason}")
+        return killed
+
     async def _restart_slot(self, idx: int, *, expected: ExcelWorkerProcess) -> None:
         delay_s = 0.5
         try:
@@ -817,8 +865,15 @@ class ExcelWorkerPool:
                     except Exception:
                         pass
                     logger.warning(f"[_restart_slot] worker start failed, retrying: {_format_exception(exc)}")
+                    try:
+                        await self._reap_orphan_excel(reason=f"restart slot {idx} failed")
+                    except Exception as reap_exc:  # noqa: BLE001
+                        logger.warning(f"[_restart_slot] orphan Excel reap failed: {_format_exception(reap_exc)}")
                     await asyncio.sleep(delay_s)
-                    delay_s = min(delay_s * 2.0, 10.0)
+                    # Excel 启动本身很重（COM 初始化 + 可能弹恢复窗）。高并发下若
+                    # 连续失败，10s 上限会让机器以每分钟数十个进程的节奏反复拉起
+                    # Excel，直接把 CPU/内存打满；退避到 60s 把抖动限制在可控范围。
+                    delay_s = min(delay_s * 2.0, 60.0)
                     continue
 
                 if self._closing:

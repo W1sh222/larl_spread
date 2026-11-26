@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -24,6 +25,8 @@ from .aio import (
 )
 from .config import (
     _get_db_path,
+    _get_max_inflight_uploads,
+    _get_max_upload_bytes,
     _get_output_root,
     _get_platform,
     _get_recalculate_job_root,
@@ -311,6 +314,85 @@ async def _wait_for_terminal_snapshot(job: JobSnapshot, *, wait_s: float) -> Job
 platform = _get_platform()
 job_manager = RewardJobManager(store=SqliteJobStore(_get_db_path()), platform=platform)
 
+_SUBMIT_PATHS = frozenset({"/reward", "/reward/submit", "/recalculate", "/recalculate/submit"})
+
+
+async def _send_json_response(
+    send,
+    status_code: int,
+    payload: dict,
+    *,
+    extra_headers: tuple[tuple[bytes, bytes], ...] = (),
+) -> None:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json; charset=utf-8"),
+        (b"content-length", str(len(body)).encode("latin-1")),
+        *extra_headers,
+    ]
+    await send({"type": "http.response.start", "status": int(status_code), "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class _UploadAdmissionMiddleware:
+    """在上传请求体被读取前做准入控制。
+
+    Starlette 会先把整个 multipart 请求体 spool 到临时目录，再调用路由函数，
+    所以原来的队列检查（在路由函数里）挡不住写盘：并发上千个上传时，即使最终
+    返回 busy，工作簿也已经完整写进 %TEMP%（默认在系统盘 C:），叠加 Defender
+    扫描会把 Windows 整机拖死。这里在接收 body 之前直接拒绝超额请求。
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._inflight = 0
+        self._max_inflight = _get_max_inflight_uploads()
+        self._max_upload_bytes = _get_max_upload_bytes()
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or str(scope.get("method", "")).upper() != "POST"
+            or str(scope.get("path", "")).rstrip("/") not in _SUBMIT_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in (scope.get("headers") or [])
+        }
+        if self._max_upload_bytes is not None:
+            content_length = headers.get("content-length", "").strip()
+            if content_length.isdigit() and int(content_length) > self._max_upload_bytes + 1024 * 1024:
+                await _send_json_response(send, 413, {"status": "error", "msg": "upload too large"})
+                return
+
+        if self._inflight >= self._max_inflight:
+            await _send_json_response(
+                send,
+                429,
+                {"status": "busy", "msg": "too many concurrent uploads"},
+                extra_headers=((b"retry-after", b"5"),),
+            )
+            return
+
+        try:
+            has_capacity = await job_manager.has_queue_capacity()
+        except Exception as exc:  # noqa: BLE001
+            # 统计失败时放行：数据库抖动不应把整条提交链路卡死。
+            logger.warning(f"[admission] queue capacity check failed: {_format_exception(exc)}")
+            has_capacity = True
+        if not has_capacity:
+            await _send_json_response(send, 200, {"status": "busy", "msg": "queue full"})
+            return
+
+        self._inflight += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._inflight -= 1
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -325,6 +407,7 @@ app = FastAPI(
     description="Submit+poll reward API backed by Excel recalculation with a shared SQLite job store.",
     lifespan=lifespan,
 )
+app.add_middleware(_UploadAdmissionMiddleware)
 
 
 @app.get("/health")
