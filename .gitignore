@@ -38,6 +38,5 @@ context-language-models/
 .gigpo_snapshot_tool.sh
 gigpo_probe_*/
 
-# gigpo_smoke 只提交脚本与配置：模型权重、venv、数据与运行产物均不入库
-gigpo_smoke/models/
-gigpo_smoke/.venv-spread/
+# 일회성 smoke 하네스(환경 재현 자료·검증 로그)는 로컬 전용: GitHub에는 올리지 않는다
+gigpo_smoke/
