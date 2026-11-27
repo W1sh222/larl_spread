@@ -9,10 +9,13 @@ export SANDBOX_FUSION_URL=${SANDBOX_FUSION_URL:-http://127.0.0.1:8080/run_code}
 export SPREADSHEET_RL_REWARD_URL=${SPREADSHEET_RL_REWARD_URL:-http://172.16.6.155:5000/reward/submit}
 export SPREADSHEET_RL_RECALC_URL=${SPREADSHEET_RL_RECALC_URL:-http://172.16.6.155:5000/recalculate}
 export SPREADSHEET_RL_REWARD_TIMEOUT_S=${SPREADSHEET_RL_REWARD_TIMEOUT_S:-600}
-export SPREADSHEET_RL_REWARD_MAX_CONCURRENT=${SPREADSHEET_RL_REWARD_MAX_CONCURRENT:-8}
-# 工具侧同时上传的重算请求上限：与服务端 4 个 Excel 实例匹配。
+# 打分并发必须 <= Windows 侧 Excel 实例数：超出会让单实例收到并发 COM 调用，
+# Excel（STA）直接抛 RPC_E_CALL_REJECTED，服务端无重试 → 该轨迹判 0 分。
+# 当前 Windows 侧实际起了 2 个实例（health: configured_instances=2），这里就设 2。
+export SPREADSHEET_RL_REWARD_MAX_CONCURRENT=${SPREADSHEET_RL_REWARD_MAX_CONCURRENT:-2}
+# 工具侧同时上传的重算请求上限：与服务端 Excel 实例数匹配。
 # 不设限时，每个 AgentLoopWorker 会把上百个工作簿同时推给 Windows，形成上传风暴。
-export SHEET_ARENA_RECALC_MAX_CONCURRENT=${SHEET_ARENA_RECALC_MAX_CONCURRENT:-4}
+export SHEET_ARENA_RECALC_MAX_CONCURRENT=${SHEET_ARENA_RECALC_MAX_CONCURRENT:-2}
 export PYTHONPATH="$REPO/verl${PYTHONPATH:+:$PYTHONPATH}"
 
 # 临时目录统一放共享盘：根分区 7T 已用 97%，raylet 在 /tmp 超 95% 时会持续告警并拒绝 object spill

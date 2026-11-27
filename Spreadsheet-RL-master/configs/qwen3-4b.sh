@@ -118,7 +118,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=65536 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=65536 \
     algorithm.use_kl_in_reward=False \
-    +reward.max_concurrent=8 \
+    +reward.max_concurrent=2 \
     +reward.timeout=10800 \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \
