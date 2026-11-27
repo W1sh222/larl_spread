@@ -137,6 +137,111 @@ algorithm:
     # resolves this generically. Set true/false to override explicitly.
     collect_step_states: null
 
+# Self-Improving Credit Assignment (Slow Loop) settings.
+# See verl/trainer/credit_assignment/self_improving/README.md.
+# The launch-time algorithm.credit_assignment node is only the metadata bootstrap config;
+# the skill actually used at each step is owned by self_improving (initial_skill or resumed state).
+self_improving:
+
+  # Master switch. When false the trainer behaves exactly as before (no LLM calls, no state files)
+  enabled: false
+
+  # Number of completed training steps between Slow Loop interventions
+  interval_steps: 20
+
+  # Skill applied before the first intervention (overridden by a resumed snapshot)
+  initial_skill:
+
+    # Must be one of candidate_skills; registered in the credit assignment library
+    method: grpo
+
+    # Partial parameter dict; normalized to the method's canonical defaults by Python
+    params: {}
+
+  # Skills the controller is allowed to select among
+  candidate_skills: [grpo, gigpo, rewardflow]
+
+  # Budgets for the training context handed to the controller LLM
+  context:
+
+    # Representative trajectories kept per training window
+    max_trajectory_samples: 4
+
+    # Steps rendered per representative trajectory
+    max_steps_per_trajectory: 20
+
+    # Truncation limit for any single free-text field
+    max_text_chars_per_field: 1000
+
+    # Hard cap on the serialized context section of the controller prompt
+    max_context_chars: 40000
+
+  # External OpenAI-compatible controller LLM. Only env var names are stored here, never values.
+  llm:
+
+    # Env var holding the full chat completions endpoint URL
+    endpoint_env: SPREADSHEET_RL_SI_LLM_URL
+
+    # Env var holding the controller model name
+    model_env: SPREADSHEET_RL_SI_LLM_MODEL
+
+    # Env var holding the API key (never written to logs, prompts or state files)
+    api_key_env: SPREADSHEET_RL_SI_LLM_API_KEY
+
+    # Per-request timeout in seconds
+    timeout_seconds: 60
+
+    # Retries per LLM request; failures fall back to keeping the current skill
+    max_retries: 1
+
+    # Sampling temperature for deterministic decisions
+    temperature: 0.0
+
+    # "api" for a real endpoint, "mock" for offline runs and smoke tests
+    client: api
+
+    # Optional JSONL script of canned responses used when client is "mock"
+    mock_script: null
+
+  # How a previous decision is judged before the next selection
+  evaluation:
+
+    # Use aggregated training-window metrics as observational evidence
+    use_training_metrics: true
+
+    # Reuse validation metrics already produced by the trainer (no extra _validate() call)
+    use_existing_validation: true
+
+    # Explicit validation metric key; null means auto-detect a single val-core/.../mean@N key
+    validation_metric_key: null
+
+    # Windows shorter than this many steps yield insufficient_evidence
+    min_window_steps: 5
+
+    # Heuristic threshold for classifying an observed delta as positive/negative
+    improvement_threshold: 0.01
+
+  # Experience-based Markdown knowledge evolution (run-local copies only)
+  knowledge:
+
+    # Disable to keep the initial knowledge frozen for the whole run
+    enabled: true
+
+    # Perform a knowledge update every N interventions
+    update_interval: 1
+
+    # Budget for knowledge text embedded in LLM prompts
+    max_prompt_chars: 20000
+
+  # Run-local state, snapshots and history under trainer.default_local_dir/self_improving
+  persistence:
+
+    # Disable to run the cycle without writing any state
+    enabled: true
+
+    # Refuse to resume when the snapshot matching the restored policy checkpoint is missing
+    strict_resume: true
+
 # config for the trainer
 trainer:
 

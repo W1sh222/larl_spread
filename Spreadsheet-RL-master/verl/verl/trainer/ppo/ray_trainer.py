@@ -1318,6 +1318,19 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
+        # Self-Improving Slow Loop: 这里只保留 thin hook, 实现全部在 credit_assignment/self_improving/
+        # val_only 不跑训练窗口, 若照样 initialize 会把上一 run 的 self_improving 目录归档并写下无意义的 state.json.
+        self._si = None
+        if (
+            self.config.get("self_improving", None) is not None
+            and self.config.self_improving.get("enabled", False)
+            and not self.config.trainer.get("val_only", False)
+        ):
+            from verl.trainer.credit_assignment.self_improving.slow_loop import SelfImprovingLoop
+
+            self._si = SelfImprovingLoop()
+            self._si.initialize(self)
+
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
@@ -1349,6 +1362,8 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            if self._si is not None:
+                self._si.observe_validation(val_metrics, self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1625,6 +1640,9 @@ class RayPPOTrainer:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
+                                if self._si is not None:
+                                    # sidecar snapshot: policy checkpoint 与 controller 状态按同一 step 对齐
+                                    self._si.on_checkpoint_saved(self.global_steps)
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
@@ -1698,6 +1716,14 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
+                if self._si is not None:
+                    self._si.on_step_end(
+                        batch=batch,
+                        metrics=metrics,
+                        timing_raw=timing_raw,
+                        global_step=self.global_steps,
+                        is_last_step=is_last_step,
+                    )
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
@@ -1714,6 +1740,8 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    if self._si is not None:
+                        self._si.finalize()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1723,3 +1751,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        if self._si is not None:
+            self._si.finalize()
